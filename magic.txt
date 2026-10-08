@@ -1,0 +1,3408 @@
+==========================================================================================
+MAGIC.TXT  -  COMPLETE CONTEXT FILE FOR THE "WEBHOOK INGESTION SERVICE" PROJECT
+==========================================================================================
+
+NOTE TO THE AI READING THIS FILE
+--------------------------------
+You are helping the author of this project. This file contains everything about the
+project: what it does, how it works, why it was built this way, how to run and test it,
+and the FULL SOURCE CODE of every file (at the end, in PART 2).
+
+When you answer questions:
+  - Use simple, clear English. The author prefers easy explanations.
+  - Base your answers on the code in PART 2. If the explanation in PART 1 and the code
+    ever disagree, the code is the truth.
+  - The project was built as a technical assessment (a job interview task). Questions may
+    be practice interview questions like "why did you use X?" or "what happens if Y
+    fails?". Section 12 has ready answers to the most likely ones.
+  - The author used an AI tool (Claude Code) to help build this. That was allowed and
+    encouraged by the assessment; see section 15.
+
+TABLE OF CONTENTS
+  PART 1 - EXPLANATION
+     1.  What this project is (in one minute)
+     2.  The assignment (what was asked)
+     3.  Technology used, and why
+     4.  Folder and file map
+     5.  The full journey of one webhook (step by step)
+     6.  Event statuses (the life of an event)
+     7.  The database table
+     8.  Security: how HMAC signature checking works
+     9.  How duplicates are prevented (idempotency)
+     10. How concurrent workers are kept safe
+     11. Retries, failures and the "sweeper"
+     12. Likely questions and answers
+     13. How to run and test the project
+     14. Settings (.env) explained
+     15. AI usage summary
+     16. Known limitations and what could be done next
+     17. Scaling to 10,000 requests per second (short version)
+  PART 2 - FULL SOURCE CODE OF EVERY FILE
+
+
+##########################################################################################
+PART 1 - EXPLANATION
+##########################################################################################
+
+------------------------------------------------------------------------------------------
+1. WHAT THIS PROJECT IS (IN ONE MINUTE)
+------------------------------------------------------------------------------------------
+Imagine an e-commerce platform with many shops. When something happens to an order
+(created, paid, cancelled...), the platform sends a message to our service over HTTP.
+This message is called a "webhook".
+
+Our service:
+  1. Receives the webhook at  POST /webhooks/order
+  2. Checks it really came from the platform (HMAC signature check, using a shared secret)
+  3. Checks the data is valid (required fields, correct types)
+  4. Saves it in a database, only ONCE, even if the same webhook is sent many times
+  5. Replies "202 Accepted" quickly
+  6. A separate background program (a Celery "worker") picks up the event and processes
+     it (sends it to a "downstream" order service, which is simulated by a function)
+  7. If processing fails, it retries automatically with increasing waits. After too many
+     failures, the event is marked FAILED and the error is saved.
+
+Important real-world problems it handles:
+  - The same event may arrive more than once      -> stored and processed only once
+  - Events may arrive at the same moment          -> database constraint + atomic updates
+  - The downstream service may fail for a while   -> automatic retries with backoff
+  - A worker may crash in the middle of a job     -> "lease" timeout lets another take over
+  - The queue (Redis) may be down                 -> event is already saved; a "sweeper"
+                                                     job re-queues it later
+
+------------------------------------------------------------------------------------------
+2. THE ASSIGNMENT (WHAT WAS ASKED)
+------------------------------------------------------------------------------------------
+Build a small production-style webhook processing service that:
+  - Implements POST /webhooks/order accepting this JSON:
+        {
+          "event_id": "evt_10001",
+          "event_type": "order.created",
+          "shop_id": "shop_123",
+          "timestamp": "2026-08-18T10:30:00Z",
+          "data": { "order_id": "ORD-1001", "customer_id": "CUS-1001", "amount": 2500 }
+        }
+  - Validates the payload
+  - Validates authenticity with HMAC / shared secret (not only IP checks)
+  - Stores the event in a database
+  - Responds quickly, processes asynchronously (background queue + worker)
+  - Never processes the same event_id twice
+  - Keeps a status: RECEIVED, PROCESSING, PROCESSED, FAILED
+  - Records retry attempts and error messages
+  - Retries temporary failures; after a limit, marks FAILED (dead letter)
+  - Documents: primary keys, unique constraints, indexes, duplicate prevention,
+    concurrent worker safety, how to handle tens of millions of rows
+  - Tests: valid request, invalid signature, duplicate, successful processing,
+    failure + retry, a concurrency case
+  - Deliverables: code, README, migrations, tests, sample .env file, scaling design note,
+    AI usage log
+
+Where each requirement is met:
+  Requirement                         | Where in the code
+  ------------------------------------|---------------------------------------------------
+  Endpoint + validation               | app/main.py, app/schemas.py
+  HMAC check                          | app/security.py, used in app/main.py
+  Store event once                    | app/ingest.py + UNIQUE constraint in app/models.py
+  Fast response + async               | app/main.py (enqueue_event) -> app/worker.py
+  Statuses, retry count, errors       | app/models.py, app/processing.py
+  Retries + FAILED after limit        | app/processing.py, app/worker.py
+  Concurrent worker safety            | app/processing.py (claim_event, _finalize)
+  Database migrations                 | migrations/versions/0001_create_webhook_events.py
+  Tests                               | tests/ folder (48 tests, all passing)
+  README / design / AI log            | README.md, docs/DESIGN.md, AI_USAGE.md
+  Sample config without real secrets  | .env.example
+
+------------------------------------------------------------------------------------------
+3. TECHNOLOGY USED, AND WHY
+------------------------------------------------------------------------------------------
+  - Python 3.13 (works on 3.11+)
+  - FastAPI        : web framework for the API. Fast, automatic validation, auto docs at /docs.
+  - Pydantic       : validates incoming JSON (schemas.py) and loads settings (config.py).
+  - SQLAlchemy 2   : talks to the database (models, queries).
+  - Alembic        : database migrations (creates/changes tables in a versioned way).
+  - SQLite         : database for local development and tests (just a file, no install).
+  - PostgreSQL     : recommended for production (docker-compose.yml uses it).
+                     The code works on both without changes.
+  - Celery         : background task queue / workers.
+  - Redis          : the message broker for Celery in production.
+                     For local testing without Redis, Celery's "sqla+sqlite" broker is
+                     used (stores queue messages in a small SQLite file).
+  - pytest         : automated tests.
+  - Docker Compose : optional; runs Postgres + Redis + API + worker + beat together.
+                     (Written but NOT tested, because Docker was not installed on the
+                     author's machine. This is stated honestly in the README.)
+
+------------------------------------------------------------------------------------------
+4. FOLDER AND FILE MAP
+------------------------------------------------------------------------------------------
+webhook-services/
+  app/
+    __init__.py         empty; makes "app" a Python package
+    main.py             the FastAPI app. Endpoints: /, /health, POST /webhooks/order,
+                        GET /webhooks/events/{event_id}, plus old alias POST /webhook/orders
+    config.py           all settings, read from environment variables / .env file
+    databases.py        database engine + sessions (SQLite tuned with WAL + busy timeout)
+    models.py           the database table "webhook_events" + status list + UTC datetime type
+    schemas.py          Pydantic models: what a valid webhook looks like, response shapes
+    security.py         HMAC-SHA256 signature create + verify
+    ingest.py           "store_event": saves an event once (handles duplicates safely)
+    processing.py       the brain of the worker: claim -> call downstream -> save result,
+                        retry rules, backoff, and the query that finds stuck events
+    worker.py           Celery app + 2 tasks (process one event; sweeper) + enqueue_event()
+    downstream.py       fake external order service (can fail randomly, for testing retries)
+    logging_config.py   JSON log format
+  migrations/
+    env.py              Alembic setup (uses DATABASE_URL from settings)
+    versions/0001_create_webhook_events.py   creates the table, constraints, indexes
+  tests/
+    conftest.py         test setup: temp database, fake secret, helpers
+    test_api.py         endpoint tests (valid, bad signature, bad data, duplicates...)
+    test_processing.py  worker logic tests (success, retry, fail, lease, sweeper query)
+    test_concurrency.py race-condition tests using 8 threads at the same moment
+    test_worker.py      full path through the real Celery task (eager mode)
+  scripts/send_webhook.py   helper: sends a correctly signed test webhook
+  docs/DESIGN.md            database design + scaling answers
+  docs/schema.postgres.sql  the generated SQL for PostgreSQL
+  README.md                 setup + beginner step-by-step testing guide
+  AI_USAGE.md               AI usage log
+  .env.example              sample settings (no real secrets)
+  .env                      real local settings (NOT shared, git-ignored)
+  requirements.txt, alembic.ini, pytest.ini, Dockerfile, docker-compose.yml,
+  .gitignore, .dockerignore
+
+------------------------------------------------------------------------------------------
+5. THE FULL JOURNEY OF ONE WEBHOOK (STEP BY STEP)
+------------------------------------------------------------------------------------------
+PART A - In the API (app/main.py), while the sender waits:
+
+  Step 1. Request arrives at POST /webhooks/order.
+  Step 2. Size check: body bigger than 64 KB -> 413 "Payload too large".
+  Step 3. Signature check FIRST (before reading the JSON):
+          compute HMAC-SHA256(secret, raw body bytes) and compare it with the
+          X-Webhook-Signature header (constant-time compare). Wrong/missing -> 401.
+          Why first? So strangers can't learn our validation rules or waste our CPU.
+  Step 4. Parse JSON. Not JSON -> 400. Not an object -> 422.
+  Step 5. Validate with Pydantic (schemas.py). Invalid -> 422 with details.
+  Step 6. INSERT into webhook_events with status RECEIVED (app/ingest.py).
+          - If event_id already exists, the database's UNIQUE constraint rejects it.
+            We catch that error, read the existing row, and reply
+            200 {"duplicate": true, "status": "<current status>"}. Nothing is re-queued.
+  Step 7. The row is COMMITTED (safely saved). Only then do we put a message on the
+          queue (enqueue_event in worker.py). The message contains only the row id.
+          If the queue is down, we just log the error; the sweeper fixes it later.
+  Step 8. Reply 202 {"event_id": ..., "status": "RECEIVED", "duplicate": false}.
+
+PART B - In the worker (app/worker.py -> app/processing.py), in the background:
+
+  Step 9.  Worker receives the message (row id) and calls process_event().
+  Step 10. CLAIM: one atomic SQL UPDATE changes status to PROCESSING only if the row is
+           RECEIVED or RETRYING (or PROCESSING but its lease expired). It also stores
+           locked_at = now and a random lock_token. If 0 rows changed, someone else has
+           it or it's already done -> SKIPPED (do nothing).
+  Step 11. Read the event data, close the DB transaction (don't hold DB locks during a
+           network call).
+  Step 12. Call the downstream service (downstream.send_order_event).
+  Step 13. Save the result with another UPDATE that only works if we still own the row
+           (same lock_token):
+             - Success            -> PROCESSED, processed_at set
+             - Temporary error    -> RETRYING, retry_count +1, error_message, next_retry_at;
+                                     a new delayed queue message is published
+             - Permanent error    -> FAILED immediately
+             - Too many failures  -> FAILED (retry_count > MAX_RETRIES)
+
+PART C - The sweeper (every 60 seconds, run by "celery beat"):
+  Finds events that look stuck and re-queues them:
+    - RECEIVED for more than 2 minutes (queue message probably lost)
+    - RETRYING and its retry time passed more than 2 minutes ago
+    - PROCESSING with a lock older than 5 minutes (worker probably crashed)
+  Re-queuing is safe because the claim step (Step 10) prevents double processing.
+
+Simple diagram:
+
+  Shop --POST--> API --(1) check HMAC --(2) validate --(3) INSERT row (RECEIVED)
+                  |                                           |
+                  |<-- 202 Accepted                    (4) queue message (row id)
+                                                              |
+                                                              v
+                                         Worker: claim -> downstream -> save result
+                                           |-- ok ---------------> PROCESSED
+                                           |-- temporary error --> RETRYING -> retry later
+                                           |-- permanent / too many --> FAILED
+
+------------------------------------------------------------------------------------------
+6. EVENT STATUSES (THE LIFE OF AN EVENT)
+------------------------------------------------------------------------------------------
+  RECEIVED    saved, waiting for a worker
+  PROCESSING  a worker has claimed it and is working on it
+  RETRYING    last try failed with a temporary error; another try is scheduled
+              (this is an extra status added beyond the 4 in the assignment, so you can
+               tell "new" apart from "waiting to retry")
+  PROCESSED   finished successfully  (final, never processed again)
+  FAILED      permanent error or retries used up (final; this is the "dead letter")
+
+  RECEIVED -> PROCESSING -> PROCESSED
+                    |
+                    +-> RETRYING -> PROCESSING -> ... -> PROCESSED or FAILED
+                    +-> FAILED
+
+------------------------------------------------------------------------------------------
+7. THE DATABASE TABLE  (webhook_events)
+------------------------------------------------------------------------------------------
+  Column         Type (Postgres)     Meaning
+  -------------  ------------------  -----------------------------------------------------
+  id             BIGSERIAL, PK       internal number; small, fast; used in queue messages
+  event_id       VARCHAR(100) UNIQUE sender's event id; UNIQUE = no duplicates possible
+  shop_id        VARCHAR(100)        which shop sent it
+  event_type     VARCHAR(100)        e.g. order.created
+  occurred_at    TIMESTAMPTZ         the "timestamp" from the webhook
+  payload        JSONB (JSON on SQLite)  the full original webhook body
+  status         VARCHAR(20) + CHECK one of the 5 statuses
+  retry_count    INT + CHECK >= 0    how many attempts have FAILED so far
+  error_message  TEXT                last error (max 2000 chars)
+  next_retry_at  TIMESTAMPTZ         when the next retry is due
+  locked_at      TIMESTAMPTZ         when a worker claimed it (the "lease")
+  lock_token     VARCHAR(36)         random id of the claim ("fencing token")
+  created_at     TIMESTAMPTZ         when we received it
+  updated_at     TIMESTAMPTZ         last change
+  processed_at   TIMESTAMPTZ         when it became PROCESSED
+
+  Constraints and indexes:
+    - PRIMARY KEY (id)
+    - UNIQUE uq_webhook_events_event_id (event_id)      -> blocks duplicates, fast lookup
+    - CHECK ck_webhook_events_status (status IN (...))   -> no invalid statuses
+    - CHECK ck_webhook_events_retry_count (retry_count >= 0)
+    - INDEX ix_webhook_events_status_updated_at (status, updated_at)
+          -> sweeper and "list FAILED events" queries
+    - INDEX ix_webhook_events_shop_id_created_at (shop_id, created_at)
+          -> "show events for a shop, newest first"
+  No index on "status" alone: it has few distinct values, and every index slows inserts.
+
+  All times are stored in UTC. A custom column type (UTCDateTime in models.py) makes
+  sure SQLite also returns timezone-aware UTC times (SQLite normally drops the timezone).
+
+  Table created by Alembic: run "alembic upgrade head".
+
+  Note: there was an older table named "Webhook_events" (capital W) from the first
+  version. It was empty. On SQLite table names ignore case, so it clashed with the new
+  name; the old empty database file was backed up and replaced.
+
+------------------------------------------------------------------------------------------
+8. SECURITY: HOW HMAC SIGNATURE CHECKING WORKS
+------------------------------------------------------------------------------------------
+  - The platform and our service share a secret key (WEBHOOK_SECRET), never sent over
+    the network.
+  - The sender computes:  signature = hex( HMAC_SHA256(secret, raw_request_body) )
+    and sends it in header:  X-Webhook-Signature: sha256=<signature>
+    (the "sha256=" prefix is optional)
+  - We compute the same thing on the exact bytes we received and compare.
+  - If even one character of the body was changed, the signature won't match -> 401.
+  - Without the secret, nobody can create a valid signature.
+  - We use hmac.compare_digest (constant-time) so attackers can't guess the signature
+    by measuring response times.
+  - We sign the RAW bytes, not re-built JSON, because re-building JSON can change spacing
+    or key order and break the signature.
+  - The secret comes from .env, has NO default, must be at least 16 characters, and is
+    stored as a SecretStr (hidden if printed/logged). The app won't start without it.
+  - Replay attacks (re-sending a captured valid request): harmless, because the same
+    event_id is treated as a duplicate.
+
+------------------------------------------------------------------------------------------
+9. HOW DUPLICATES ARE PREVENTED (IDEMPOTENCY)
+------------------------------------------------------------------------------------------
+  "Idempotent" = doing it twice has the same effect as doing it once.
+
+  Layer 1 - When storing (app/ingest.py):
+    WRONG way (the first version of this project did this):
+        "SELECT to check if event_id exists; if not, INSERT"
+      Problem: two identical requests at the same moment both see "doesn't exist" and
+      both insert (or one crashes with an error).
+    RIGHT way (current code):
+        just INSERT; the database's UNIQUE constraint lets only ONE succeed.
+        The other gets IntegrityError -> we rollback, read the existing row, and answer
+        200 duplicate. If the error was about something else, we re-raise it.
+    Test proving it: test_concurrent_duplicate_deliveries_store_exactly_one_row
+                     (8 threads send the same event at the exact same moment -> 1 row)
+
+  Layer 2 - When processing (app/processing.py):
+    Queues deliver "at least once": the same task may run twice (worker crash, sweeper,
+    redelivery). The claim step only works on RECEIVED/RETRYING rows. PROCESSED and
+    FAILED rows can never be claimed again, so running a task twice does nothing extra.
+    Test proving it: test_duplicate_task_deliveries_call_downstream_once
+                     (8 threads process the same event -> downstream called exactly once)
+
+  Why reply 200 (not 409 error) for duplicates? Senders retry on errors. A 2xx tells
+  them "got it, stop sending".
+
+------------------------------------------------------------------------------------------
+10. HOW CONCURRENT WORKERS ARE KEPT SAFE
+------------------------------------------------------------------------------------------
+  The claim is one SQL statement:
+
+    UPDATE webhook_events
+       SET status='PROCESSING', locked_at=now, lock_token=<random uuid>, updated_at=now
+     WHERE id = <id>
+       AND ( status IN ('RECEIVED','RETRYING')
+             OR (status='PROCESSING' AND locked_at < now - 300 seconds) );
+
+  - The database runs UPDATEs on the same row one at a time. So if 8 workers try at once,
+    exactly ONE gets "1 row updated". The others get 0 and skip.
+  - Works on SQLite, PostgreSQL and MySQL. No external lock (like Redis) needed.
+  - Alternatives considered: SELECT ... FOR UPDATE (would hold a DB lock during the slow
+    network call) and Redis locks (extra moving part, can expire wrongly). The single
+    conditional UPDATE is simpler and safe.
+
+  Lease (locked_at): if a worker crashes mid-job, the row stays PROCESSING forever.
+  After PROCESSING_LEASE_SECONDS (300s) another worker or the sweeper may reclaim it.
+
+  Fencing token (lock_token): imagine worker A freezes for 6 minutes. Its lease expires,
+  worker B claims and finishes the event. Then A wakes up and tries to save its result.
+  Because every "save result" UPDATE includes "AND lock_token = <my token>", A's update
+  changes 0 rows and is ignored. B's result is protected.
+  Test proving it: test_expired_lease_is_reclaimed_and_stale_worker_is_fenced_off
+
+  Celery settings that help:
+    task_acks_late=True              -> message removed from queue only AFTER the task
+                                        finishes; a crash means the message comes back
+    task_reject_on_worker_lost=True  -> same idea for killed worker processes
+    worker_prefetch_multiplier=1     -> a worker doesn't grab many messages it can't start
+
+------------------------------------------------------------------------------------------
+11. RETRIES, FAILURES AND THE "SWEEPER"
+------------------------------------------------------------------------------------------
+  Error types (app/downstream.py):
+    TransientDownstreamError  temporary (timeout, server down) -> retry
+    PermanentDownstreamError  retrying won't help (bad data)   -> FAILED immediately
+    Any other unexpected error                                  -> treated as temporary
+
+  Retry rules (app/processing.py):
+    - Each failure: retry_count +1, error_message saved.
+    - If retry_count > MAX_RETRIES (default 5) -> FAILED.
+      So an event gets 1 first try + 5 retries = 6 attempts max.
+    - Wait time before retry = random number between 0 and
+      min(300s, 2s * 2^(retry_count-1)), but at least 1 second.
+      This is "exponential backoff with full jitter":
+        exponential = waits grow 2s, 4s, 8s, 16s... so we don't hammer a broken service
+        jitter (random) = many failed events don't all retry at the exact same second
+    - The retry limit is counted in the DATABASE (retry_count), not in Celery's memory,
+      so it survives worker restarts.
+
+  How a retry is scheduled (app/worker.py):
+    The task publishes a new delayed message: process_event_task.apply_async(countdown=X).
+    The first version used Celery's self.retry(), but in tests (eager mode) it raised an
+    exception instead of re-running, so it was replaced. The new way behaves the same with
+    a real broker and is easy to test.
+    If publishing the retry fails, the sweeper picks the event up later.
+
+  Dead letter:
+    FAILED rows are the dead-letter queue. They keep error_message and retry_count and
+    can be listed using the (status, updated_at) index. (A "replay failed events" command
+    is NOT built; it would set status back to RECEIVED and re-queue.)
+
+  Sweeper (requeue_stalled_events task, scheduled every 60s by celery beat):
+    See section 5 Part C. Covers: queue was down when the webhook arrived, message lost,
+    worker crashed, retry message lost.
+
+------------------------------------------------------------------------------------------
+12. LIKELY QUESTIONS AND ANSWERS
+------------------------------------------------------------------------------------------
+Q: Why return 202 and not 200 for a new event?
+A: 202 means "accepted, will be processed later". The work happens in the background.
+
+Q: Why process in the background instead of in the request?
+A: The downstream service may be slow or down. The sender should get a fast answer.
+   Saving to DB is quick; the slow part happens in the worker.
+
+Q: What if the server crashes right after saving but before queueing?
+A: The row is RECEIVED in the DB. The sweeper finds it after ~2 minutes and queues it.
+
+Q: What if Redis/the queue is down?
+A: The API still saves the event and returns 202 (enqueue_event never raises). The
+   sweeper re-queues once the queue is back. Test: test_broker_outage_still_accepts_event.
+
+Q: What if the worker crashes in the middle?
+A: acks_late makes the queue redeliver the message, and the lease (5 min) lets the
+   event be reclaimed. The fencing token stops the old worker from overwriting.
+
+Q: Can an event be sent downstream twice?
+A: In one rare case, yes: if the worker crashes AFTER the downstream call succeeded but
+   BEFORE saving PROCESSED. Exactly-once across a network is impossible in general. The
+   fix is for the downstream API to accept event_id as an "idempotency key" and ignore
+   repeats. This is documented.
+
+Q: Why SQLite?
+A: Allowed by the assignment and needs no setup, good for tests/local runs. The code and
+   migrations also work on PostgreSQL (recommended for production; docker-compose uses
+   it). SQLite is tuned with WAL mode (reads and writes at the same time) and a 30s
+   busy timeout (writers wait instead of failing).
+
+Q: Why check the signature before validating the JSON?
+A: Unauthenticated callers shouldn't see our validation error messages or make us do
+   parsing work. The first version validated first; this was fixed.
+
+Q: Why Decimal for amount?
+A: Floats can't represent money exactly (0.1 + 0.2 != 0.3). Decimal can.
+
+Q: Why does the timestamp need a timezone?
+A: "10:30" without a timezone is ambiguous. We require e.g. "2026-08-18T10:30:00Z".
+
+Q: Why a separate id AND event_id?
+A: event_id is an outside string of unknown length/format. A small integer primary key
+   is faster for indexes and is what we put in queue messages.
+
+Q: Why is the unique key event_id and not (shop_id, event_id)?
+A: We assume the platform makes globally unique event ids. If they were only unique per
+   shop, the constraint would become UNIQUE(shop_id, event_id).
+
+Q: Same event_id but different content?
+A: Treated as a duplicate; the first version is kept; a warning is logged.
+
+Q: How do you handle a table with tens of millions of rows?
+A: Partition by created_at (e.g. monthly) so old data can be dropped fast; a partial
+   index only on unfinished statuses so worker queries stay fast; move old payloads to
+   cheap storage (S3); read replicas for lookups. Details in docs/DESIGN.md.
+
+Q: What do the tests cover?
+A: 48 tests: valid webhook, sha256= prefix, invalid signatures (missing, empty, garbage,
+   wrong secret, tampered body, checked before validation), 8 kinds of invalid data,
+   non-JSON, too large, duplicates, broker down, old route alias, status endpoint,
+   health, success processing, retry then success, unexpected errors retried, FAILED
+   after limit, permanent failure, no re-processing, lease reclaim + fencing, sweeper,
+   backoff limits, 3 concurrency tests with 8 threads, full Celery path in eager mode.
+
+Q: What was the first version's problems (before improvement)?
+A: Wrong route (/webhook/orders), hardcoded secret "my-secret-key", validation before
+   signature check, check-then-insert race, float money, naive datetime.utcnow, no
+   queue/worker, no tests, no migrations. All fixed. The old route still works as a
+   hidden alias so nothing breaks.
+
+------------------------------------------------------------------------------------------
+13. HOW TO RUN AND TEST THE PROJECT
+------------------------------------------------------------------------------------------
+(Full beginner guide with troubleshooting is in README.md.)
+
+ONE-TIME SETUP (Windows Command Prompt; Mac/Linux differences in brackets):
+  1. Check Python 3.11+:            python --version
+  2. Go to the project folder:      cd path\to\webhook-services
+  3. Delete any "venv" folder that came with the project (venvs don't work on other PCs)
+  4. Create venv:                   python -m venv venv
+  5. Activate venv:                 venv\Scripts\activate        [source venv/bin/activate]
+     (you must see "(venv)" at the start of the line; do this in EVERY new terminal)
+  6. Install libraries:             pip install -r requirements.txt
+  7. Create settings file:          copy .env.example .env       [cp .env.example .env]
+  8. Generate a secret:             python -c "import secrets; print(secrets.token_hex(32))"
+     Put it in .env:                WEBHOOK_SECRET=<that long text>
+  9. In .env, switch to the local queue (no Redis needed):
+        # CELERY_BROKER_URL=redis://localhost:6379/0
+        CELERY_BROKER_URL=sqla+sqlite:///./celery-broker.db
+ 10. Create the database:           alembic upgrade head
+
+AUTOMATED TESTS:
+  pytest            -> expect "48 passed"
+  pytest -v         -> shows each test name
+  (Tests use their own temporary database and need nothing else running.)
+
+MANUAL TEST (3 terminals, all with venv activated):
+  Terminal 1 (worker):  celery -A app.worker worker --pool=solo --loglevel=INFO
+                        wait for "ready."   (--pool=solo is needed on Windows)
+  Terminal 2 (API):     uvicorn app.main:app --reload
+                        wait for "Uvicorn running on http://127.0.0.1:8000"
+                        browser: http://127.0.0.1:8000/health  -> {"status":"ok",...}
+                        browser: http://127.0.0.1:8000/docs    -> interactive API page
+  Terminal 3 (send):
+    python scripts/send_webhook.py --event-id evt_test_1   -> 202 ... "duplicate":false
+    browser: http://127.0.0.1:8000/webhooks/events/evt_test_1  -> "status":"PROCESSED"
+             (may briefly show RETRYING because .env.example sets a 20% fake failure rate)
+    python scripts/send_webhook.py --event-id evt_test_1   -> 200 ... "duplicate":true
+    python scripts/send_webhook.py --bad-signature          -> 401 Invalid webhook signature
+  Watch retries: set DOWNSTREAM_FAILURE_RATE=0.5 in .env, restart the worker (Ctrl+C,
+    run again), send several events; worker logs show "processing failed, scheduling
+    retry" then "event processed".
+  See FAILED: DOWNSTREAM_FAILURE_RATE=1, restart worker, send one event; after 6 attempts
+    its status is FAILED with error_message filled.
+  Optional sweeper: celery -A app.worker beat --loglevel=INFO   (4th terminal)
+  Stop: Ctrl+C in each terminal.
+
+COMMON ERRORS:
+  'celery'/'uvicorn'/'pytest' is not recognized -> venv not activated (step 5)
+  '--pool': 'sol' is not one of ...              -> typo, use --pool=solo
+  webhook_secret Field required                  -> .env missing or not named exactly .env
+  webhook_secret Value should have at least 16   -> secret empty/too short
+  no such table: webhook_events                  -> run alembic upgrade head
+  Error 10061 / connection refused (Redis 6379)  -> do step 9 (use sqla+sqlite broker)
+  script always gets 401                         -> .env changed after API started; restart API
+  event stuck in RECEIVED                        -> worker not running / started before .env change
+  port 8000 in use -> uvicorn app.main:app --port 8001 and
+                      python scripts/send_webhook.py --url http://127.0.0.1:8001/webhooks/order
+  PowerShell "running scripts is disabled"       -> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+                                                    (or use Command Prompt)
+
+------------------------------------------------------------------------------------------
+14. SETTINGS (.env) EXPLAINED
+------------------------------------------------------------------------------------------
+  WEBHOOK_SECRET               shared HMAC secret; required; min 16 chars; no default
+  DATABASE_URL                 default sqlite:///./webhook.db
+                               Postgres: postgresql+psycopg://user:pass@host:5432/db
+  CELERY_BROKER_URL            default redis://localhost:6379/0
+                               local no-Redis option: sqla+sqlite:///./celery-broker.db
+  CELERY_TASK_ALWAYS_EAGER     true = run tasks inside the API process (debug only)
+  MAX_RETRIES                  default 5 (so max 6 attempts)
+  RETRY_BACKOFF_BASE_SECONDS   default 2
+  RETRY_BACKOFF_MAX_SECONDS    default 300
+  PROCESSING_LEASE_SECONDS     default 300 (how long a claim is valid)
+  SWEEPER_INTERVAL_SECONDS     default 60
+  SWEEPER_GRACE_SECONDS        default 120 (how long before an event counts as "stuck")
+  SWEEPER_BATCH_SIZE           default 500
+  DOWNSTREAM_FAILURE_RATE      0..1 chance the fake downstream fails (code default 0,
+                               .env.example uses 0.2 for demos)
+  DOWNSTREAM_LATENCY_SECONDS   fake network delay, default 0.05
+  MAX_BODY_BYTES               default 65536 (64 KB)
+  LOG_LEVEL                    default INFO
+  SIGNATURE_HEADER             default X-Webhook-Signature
+  DB_ECHO                      true = print all SQL (debug)
+  Environment variables override values in .env. The real .env is git-ignored.
+
+------------------------------------------------------------------------------------------
+15. AI USAGE SUMMARY
+------------------------------------------------------------------------------------------
+  Claude Code (in VS Code) was used to review the first version, draft code, find edge
+  cases, write tests and docs. Things it caught or that were changed after testing:
+    - check-then-insert race -> replaced by UNIQUE constraint + IntegrityError handling
+    - signature checked after validation -> moved before
+    - hardcoded secret -> .env with no default
+    - stale worker could overwrite results -> added lock_token fencing
+    - Celery self.retry() failed in eager-mode tests -> switched to apply_async(countdown)
+    - SQLite drops timezones -> added UTCDateTime type
+    - broker down after commit would strand events -> non-raising enqueue + sweeper
+    - old table name clash on SQLite (case-insensitive) -> fresh database
+  Everything was verified by 48 tests and a live run (API + real Celery worker, 30% fake
+  failure rate: all 12 events ended PROCESSED, some after 1-2 retries; duplicate -> 200;
+  bad signature -> 401). Full log in AI_USAGE.md.
+
+------------------------------------------------------------------------------------------
+16. KNOWN LIMITATIONS AND WHAT COULD BE DONE NEXT
+------------------------------------------------------------------------------------------
+  - Docker Compose setup is written but not tested (no Docker on the dev machine).
+  - No signed-timestamp header (would block replays that use NEW event ids; needs the
+    sender to support it).
+  - No secret rotation (accepting old + new secret during a change).
+  - No "replay FAILED events" command/endpoint.
+  - GET /webhooks/events/{event_id} has no auth (it hides the payload; in production it
+    should be internal-only).
+  - No metrics endpoint (Prometheus) yet.
+  - Tests run on SQLite only; CI against PostgreSQL would be the next step.
+
+------------------------------------------------------------------------------------------
+17. SCALING TO 10,000 REQUESTS PER SECOND (SHORT VERSION; FULL IN docs/DESIGN.md)
+------------------------------------------------------------------------------------------
+  API: stateless, so just run more copies behind a load balancer (~15-25 instances),
+       autoscale on CPU/latency, use PgBouncer so DB connections don't run out.
+  Workers: run more, scale on queue length/age (e.g. KEDA). At 100 ms downstream
+       latency, 10k/s needs ~1000 concurrent task slots; use gevent/async pools; separate
+       queues per priority; per-shop limits so one shop can't block others.
+  DB bottleneck: put Kafka/Kinesis in front and write in batches with
+       INSERT ... ON CONFLICT DO NOTHING; partition the table by time; partial index on
+       unfinished statuses; Redis duplicate pre-check; finally shard by shop_id.
+  Duplicates: Redis SET NX fast check -> DB UNIQUE constraint (the real guard) ->
+       idempotent claim -> event_id as idempotency key to downstream.
+  Queue failure: commit-before-publish + sweeper = nothing lost; replicated Redis, or
+       RabbitMQ quorum queues / SQS.
+  Downstream failure: backoff + jitter, circuit breaker, dead letter (FAILED) + replay.
+  Redis useful for: dedup cache, broker, rate limits, circuit-breaker state, caching
+       per-shop config/secrets, caching status lookups.
+  Monitoring: request rate/latency/status codes, 401 spikes, duplicate rate, queue
+       depth + oldest message age, processing delay (processed_at - created_at),
+       PROCESSED/RETRY/FAILED counts, downstream errors, sweeper re-queues, DB health.
+       Alerts on: old unprocessed events, FAILED spikes, sweeper constantly working,
+       5xx errors, DB near limits. JSON logs with event_id for tracing (already done).
+
+
+##########################################################################################
+PART 2 - FULL SOURCE CODE OF EVERY FILE
+##########################################################################################
+(The real .env file is intentionally NOT included because it contains the secret.)
+
+
+==========================================================================================
+FILE: app/__init__.py
+==========================================================================================
+(empty file)
+
+
+==========================================================================================
+FILE: app/main.py
+==========================================================================================
+import json
+import logging
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
+
+from .config import get_settings
+from .databases import get_db
+from .ingest import store_event
+from .logging_config import configure_logging
+from .models import WebhookEvent
+from .schemas import EventStatusResponse, HealthResponse, WebhookAccepted, WebhookRequest
+from .security import verify_signature
+from .worker import enqueue_event
+
+settings = get_settings()
+configure_logging(settings.log_level)
+logger = logging.getLogger(__name__)
+
+# Schema is managed by Alembic migrations (`alembic upgrade head`), not create_all().
+app = FastAPI(title="Webhook Ingestion Service", version="1.0.0")
+
+
+@app.get("/")
+def home():
+    return {"message": "Webhook running"}
+
+
+@app.get("/health", response_model=HealthResponse)
+def health(response: Response, db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        return HealthResponse(status="ok", database="ok")
+    except Exception:
+        logger.exception("health check: database unavailable")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return HealthResponse(status="degraded", database="unavailable")
+
+
+async def verified_order_webhook(request: Request) -> tuple[WebhookRequest, dict[str, Any]]:
+    """Authenticate first, then parse.
+
+    The HMAC is checked against the raw bytes *before* any JSON parsing or
+    validation, so unauthenticated callers can't probe our validation rules or
+    make us do parsing work.
+    """
+    declared_length = request.headers.get("content-length")
+    if declared_length and declared_length.isdigit() and int(declared_length) > settings.max_body_bytes:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Payload too large")
+
+    body = await request.body()
+    if len(body) > settings.max_body_bytes:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Payload too large")
+
+    if not verify_signature(body, request.headers.get(settings.signature_header)):
+        logger.warning("rejected webhook with invalid signature", extra={"client": getattr(request.client, "host", None)})
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature")
+
+    try:
+        raw = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body is not valid JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Body must be a JSON object")
+
+    try:
+        webhook = WebhookRequest.model_validate(raw)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(include_url=False))
+    return webhook, raw
+
+
+@app.post(
+    "/webhooks/order",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=WebhookAccepted,
+    responses={
+        200: {"model": WebhookAccepted, "description": "Duplicate event_id; already accepted earlier"},
+        401: {"description": "Missing or invalid signature"},
+    },
+)
+def receive_order_webhook(
+    response: Response,
+    verified: tuple[WebhookRequest, dict[str, Any]] = Depends(verified_order_webhook),
+    db: Session = Depends(get_db),
+) -> WebhookAccepted:
+    webhook, raw = verified
+    result = store_event(db, webhook, raw)
+    event = result.event
+
+    if not result.created:
+        # 2xx so the sender stops redelivering; nothing is enqueued again.
+        logger.info("duplicate webhook ignored", extra={"event_id": event.event_id, "status": event.status})
+        response.status_code = status.HTTP_200_OK
+        return WebhookAccepted(
+            event_id=event.event_id, status=event.status, duplicate=True, message="Event already received"
+        )
+
+    # The row is committed before we publish, so the event can never be lost:
+    # if publishing fails the sweeper re-enqueues it.
+    enqueue_event(event.id)
+    logger.info("webhook accepted", extra={"event_id": event.event_id, "shop_id": event.shop_id})
+    return WebhookAccepted(event_id=event.event_id, status=event.status, duplicate=False, message="Webhook accepted")
+
+
+# Backwards-compatible alias for the route this service originally exposed.
+app.add_api_route(
+    "/webhook/orders",
+    receive_order_webhook,
+    methods=["POST"],
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=WebhookAccepted,
+    include_in_schema=False,
+)
+
+
+@app.get("/webhooks/events/{event_id}", response_model=EventStatusResponse)
+def get_event_status(event_id: str, db: Session = Depends(get_db)):
+    """Operational lookup of an event's processing state (payload is not exposed).
+    In production this belongs behind internal auth / the admin network."""
+    event = db.scalar(select(WebhookEvent).where(WebhookEvent.event_id == event_id))
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+    return EventStatusResponse.model_validate(event, from_attributes=True)
+
+
+==========================================================================================
+FILE: app/config.py
+==========================================================================================
+"""Application configuration, loaded from environment variables / a local .env file.
+
+Secrets (WEBHOOK_SECRET) have no default on purpose: the service refuses to start
+without one instead of silently running with a well-known value.
+"""
+from functools import lru_cache
+
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # --- Database -----------------------------------------------------------
+    database_url: str = "sqlite:///./webhook.db"
+    db_echo: bool = False
+
+    # --- Webhook authentication --------------------------------------------
+    webhook_secret: SecretStr = Field(min_length=16)
+    signature_header: str = "X-Webhook-Signature"
+    max_body_bytes: int = 64 * 1024
+
+    # --- Queue / worker -----------------------------------------------------
+    celery_broker_url: str = "redis://localhost:6379/0"
+    # Run tasks inline in the calling process. Only for local debugging/tests.
+    celery_task_always_eager: bool = False
+
+    # Retry policy: an event gets 1 initial attempt + max_retries retries.
+    max_retries: int = Field(default=5, ge=0)
+    retry_backoff_base_seconds: float = Field(default=2.0, gt=0)
+    retry_backoff_max_seconds: float = Field(default=300.0, gt=0)
+
+    # A PROCESSING row whose lock is older than this is assumed to belong to a
+    # crashed worker and may be reclaimed. Must exceed the slowest downstream call.
+    processing_lease_seconds: int = Field(default=300, gt=0)
+
+    # Sweeper: re-enqueue events whose queue message was lost (broker outage,
+    # crash between commit and publish, ...).
+    sweeper_interval_seconds: int = Field(default=60, gt=0)
+    sweeper_grace_seconds: int = Field(default=120, ge=0)
+    sweeper_batch_size: int = Field(default=500, gt=0)
+
+    # --- Simulated downstream service ---------------------------------------
+    downstream_failure_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    downstream_latency_seconds: float = Field(default=0.05, ge=0.0)
+
+    log_level: str = "INFO"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+==========================================================================================
+FILE: app/databases.py
+==========================================================================================
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from .config import get_settings
+
+settings = get_settings()
+
+
+def _build_engine(url: str) -> Engine:
+    if url.startswith("sqlite"):
+        engine = create_engine(
+            url,
+            echo=settings.db_echo,
+            # SQLite connections are shared across FastAPI's threadpool.
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+
+        @event.listens_for(engine, "connect")
+        def _sqlite_pragmas(dbapi_connection, _record):
+            cursor = dbapi_connection.cursor()
+            # WAL lets the API write while workers read; busy_timeout makes
+            # concurrent writers wait for the lock instead of failing fast.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        return engine
+
+    return create_engine(
+        url,
+        echo=settings.db_echo,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+    )
+
+
+engine = _build_engine(settings.database_url)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    bind=engine,
+)
+
+Base = declarative_base()
+
+
+def get_db() -> Iterator[Session]:
+    """FastAPI dependency: one session per request."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    """Session for worker code; rolls back on error and always closes."""
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+==========================================================================================
+FILE: app/models.py
+==========================================================================================
+import enum
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+
+from .databases import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class EventStatus(str, enum.Enum):
+    RECEIVED = "RECEIVED"      # stored, waiting for a worker
+    PROCESSING = "PROCESSING"  # claimed by a worker (see locked_at / lock_token)
+    RETRYING = "RETRYING"      # last attempt failed transiently, retry scheduled
+    PROCESSED = "PROCESSED"    # terminal: downstream accepted the event
+    FAILED = "FAILED"          # terminal: permanent error or retries exhausted (dead letter)
+
+
+class UTCDateTime(TypeDecorator):
+    """Timezone-aware UTC datetimes on every backend.
+
+    Postgres stores TIMESTAMPTZ natively; SQLite has no timezone support and
+    returns naive values, so we normalise to UTC on write and re-attach UTC on read.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            if value.tzinfo is None:
+                raise ValueError("naive datetime given; use timezone-aware UTC datetimes")
+            value = value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
+
+# BIGINT on Postgres/MySQL; SQLite only auto-increments "INTEGER PRIMARY KEY".
+BigIntPK = BigInteger().with_variant(Integer, "sqlite")
+JSONPayload = JSON().with_variant(JSONB(), "postgresql")
+
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+
+    # Surrogate key: compact, monotonic, cheap to index and to reference.
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+
+    # Natural key from the sender. The UNIQUE constraint (not an application-level
+    # "SELECT then INSERT") is what guarantees an event is stored only once,
+    # even when duplicates arrive concurrently on different API instances.
+    event_id = Column(String(100), nullable=False)
+    shop_id = Column(String(100), nullable=False)
+    event_type = Column(String(100), nullable=False)
+    occurred_at = Column(UTCDateTime(), nullable=False)  # sender's "timestamp"
+    payload = Column(JSONPayload, nullable=False)
+
+    status = Column(String(20), nullable=False, default=EventStatus.RECEIVED.value, server_default="RECEIVED")
+    # Number of failed processing attempts so far.
+    retry_count = Column(Integer, nullable=False, default=0, server_default="0")
+    error_message = Column(Text, nullable=True)
+    next_retry_at = Column(UTCDateTime(), nullable=True)
+
+    # Worker lease. lock_token acts as a fencing token: a worker can only
+    # finalize an event while it still holds the token it claimed it with.
+    locked_at = Column(UTCDateTime(), nullable=True)
+    lock_token = Column(String(36), nullable=True)
+
+    created_at = Column(UTCDateTime(), nullable=False, default=utcnow)
+    updated_at = Column(UTCDateTime(), nullable=False, default=utcnow, onupdate=utcnow)
+    processed_at = Column(UTCDateTime(), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("event_id", name="uq_webhook_events_event_id"),
+        CheckConstraint(
+            "status IN ('RECEIVED','PROCESSING','RETRYING','PROCESSED','FAILED')",
+            name="ck_webhook_events_status",
+        ),
+        CheckConstraint("retry_count >= 0", name="ck_webhook_events_retry_count"),
+        # Sweeper / ops queries: "events in status X older than T".
+        Index("ix_webhook_events_status_updated_at", "status", "updated_at"),
+        # Per-shop listing / support lookups, newest first.
+        Index("ix_webhook_events_shop_id_created_at", "shop_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<WebhookEvent id={self.id} event_id={self.event_id!r} status={self.status}>"
+
+
+==========================================================================================
+FILE: app/schemas.py
+==========================================================================================
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, Literal
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
+
+# Identifiers are opaque strings from the sender; bound their size to match the
+# DB columns and keep them to a safe character set.
+Identifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:\-]+$"),
+]
+
+
+class OrderData(BaseModel):
+    # Unknown fields inside "data" are kept (stored as-is in the payload column)
+    # so new optional attributes from the platform don't cause rejections.
+    model_config = ConfigDict(extra="allow")
+
+    order_id: Identifier
+    customer_id: Identifier
+    # Decimal, not float: money must not suffer binary rounding.
+    amount: Decimal = Field(ge=0, max_digits=18, decimal_places=4)
+
+
+class WebhookRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    event_id: Identifier
+    event_type: Annotated[str, StringConstraints(pattern=r"^order\.[a-z_]+$", max_length=100)]
+    shop_id: Identifier
+    # Must carry a timezone (e.g. "...Z"); naive timestamps are ambiguous.
+    timestamp: AwareDatetime
+    data: OrderData
+
+
+class WebhookAccepted(BaseModel):
+    event_id: str
+    status: str
+    duplicate: bool
+    message: str
+
+
+class EventStatusResponse(BaseModel):
+    event_id: str
+    shop_id: str
+    event_type: str
+    status: str
+    retry_count: int
+    error_message: str | None
+    next_retry_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    processed_at: datetime | None
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "degraded"]
+    database: Literal["ok", "unavailable"]
+
+
+==========================================================================================
+FILE: app/security.py
+==========================================================================================
+"""HMAC-SHA256 webhook signatures.
+
+The sender computes ``hex(HMAC_SHA256(secret, raw_request_body))`` and sends it in
+the ``X-Webhook-Signature`` header, optionally prefixed with ``sha256=``.
+
+The signature is computed over the *raw bytes* we received, never over a
+re-serialised JSON object, because re-serialisation is not byte-for-byte stable.
+"""
+import hashlib
+import hmac
+
+from .config import get_settings
+
+_PREFIX = "sha256="
+
+
+def compute_signature(payload: bytes, secret: str | None = None) -> str:
+    key = secret if secret is not None else get_settings().webhook_secret.get_secret_value()
+    return hmac.new(key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def verify_signature(payload: bytes, signature: str | None, secret: str | None = None) -> bool:
+    if not signature:
+        return False
+    candidate = signature.strip()
+    if candidate.lower().startswith(_PREFIX):
+        candidate = candidate[len(_PREFIX):]
+    expected = compute_signature(payload, secret)
+    # Constant-time comparison avoids leaking the signature via timing.
+    return hmac.compare_digest(expected, candidate.lower())
+
+
+==========================================================================================
+FILE: app/ingest.py
+==========================================================================================
+"""Storing incoming webhooks exactly once."""
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .models import EventStatus, WebhookEvent
+from .schemas import WebhookRequest
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    event: WebhookEvent
+    created: bool
+
+
+def store_event(db: Session, webhook: WebhookRequest, raw_payload: dict[str, Any]) -> IngestResult:
+    """Insert the event, or return the existing row if ``event_id`` was seen before.
+
+    We deliberately do *not* "SELECT, then INSERT if missing": two concurrent
+    deliveries would both see "missing". Instead we INSERT and let the UNIQUE
+    constraint on ``event_id`` arbitrate; the loser gets an IntegrityError and
+    reads the winner's row.
+    """
+    event = WebhookEvent(
+        event_id=webhook.event_id,
+        shop_id=webhook.shop_id,
+        event_type=webhook.event_type,
+        occurred_at=webhook.timestamp,
+        payload=raw_payload,
+        status=EventStatus.RECEIVED.value,
+        retry_count=0,
+    )
+    db.add(event)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(select(WebhookEvent).where(WebhookEvent.event_id == webhook.event_id))
+        if existing is None:
+            # The violation was not the event_id uniqueness - don't hide it.
+            raise
+        if existing.payload != raw_payload:
+            logger.warning(
+                "duplicate event_id with a different payload; keeping the first version",
+                extra={"event_id": webhook.event_id},
+            )
+        return IngestResult(event=existing, created=False)
+    return IngestResult(event=event, created=True)
+
+
+==========================================================================================
+FILE: app/processing.py
+==========================================================================================
+"""Idempotent, concurrency-safe processing of stored webhook events.
+
+The queue gives *at-least-once* delivery: the same task can run twice (worker
+crash before ack, sweeper re-enqueue, broker redelivery). Correctness therefore
+lives in the database, not in the queue:
+
+1. **Claim** - a single conditional UPDATE moves the row to PROCESSING only if it
+   is RECEIVED/RETRYING (or PROCESSING with an expired lease). The database
+   serialises concurrent UPDATEs on one row, so exactly one worker sees
+   ``rowcount == 1``; everyone else skips. PROCESSED/FAILED rows are never claimed
+   again, which is what makes processing idempotent.
+2. **Work** - call downstream with no DB transaction held open.
+3. **Finalize** - another conditional UPDATE guarded by the claim's
+   ``lock_token``. If our lease expired and another worker took over, our
+   update matches zero rows and we back off instead of overwriting its result.
+"""
+import logging
+import random
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any
+
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.orm import Session
+
+from .config import Settings, get_settings
+from .downstream import PermanentDownstreamError, send_order_event
+from .models import EventStatus, WebhookEvent, utcnow
+
+logger = logging.getLogger(__name__)
+
+MAX_ERROR_LENGTH = 2000
+
+Downstream = Callable[[dict[str, Any]], None]
+
+
+class Outcome(str, Enum):
+    PROCESSED = "PROCESSED"
+    RETRY = "RETRY"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"  # not claimable: already done, in flight elsewhere, or missing
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    outcome: Outcome
+    retry_in_seconds: float | None = None
+
+
+def compute_backoff(retry_count: int, settings: Settings) -> float:
+    """Exponential backoff with full jitter: random(0, min(cap, base * 2^(n-1)))."""
+    ceiling = min(settings.retry_backoff_max_seconds, settings.retry_backoff_base_seconds * 2 ** max(retry_count - 1, 0))
+    # Floor at 1s so a burst of failures doesn't hammer a struggling dependency.
+    return max(1.0, random.uniform(0, ceiling))
+
+
+def claim_event(db: Session, event_pk: int, settings: Settings) -> str | None:
+    """Atomically take ownership of an event. Returns the lock token, or None."""
+    now = utcnow()
+    token = str(uuid.uuid4())
+    lease_expired_before = now - timedelta(seconds=settings.processing_lease_seconds)
+    result = db.execute(
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event_pk,
+            or_(
+                WebhookEvent.status.in_([EventStatus.RECEIVED.value, EventStatus.RETRYING.value]),
+                and_(
+                    WebhookEvent.status == EventStatus.PROCESSING.value,
+                    WebhookEvent.locked_at < lease_expired_before,
+                ),
+            ),
+        )
+        .values(status=EventStatus.PROCESSING.value, locked_at=now, lock_token=token, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return token if result.rowcount == 1 else None
+
+
+def _finalize(db: Session, event_pk: int, token: str, **values: Any) -> bool:
+    now = utcnow()
+    result = db.execute(
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event_pk,
+            WebhookEvent.status == EventStatus.PROCESSING.value,
+            WebhookEvent.lock_token == token,
+        )
+        .values(locked_at=None, lock_token=None, updated_at=now, **values)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    if result.rowcount != 1:
+        logger.warning("lost lease before finalizing; another worker owns the event", extra={"event_pk": event_pk})
+        return False
+    return True
+
+
+def _snapshot(event: WebhookEvent) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "shop_id": event.shop_id,
+        "payload": event.payload,
+    }
+
+
+def process_event(
+    db: Session,
+    event_pk: int,
+    *,
+    downstream: Downstream | None = None,
+    settings: Settings | None = None,
+) -> ProcessResult:
+    settings = settings or get_settings()
+    downstream = downstream or send_order_event
+
+    token = claim_event(db, event_pk, settings)
+    if token is None:
+        current = db.scalar(select(WebhookEvent.status).where(WebhookEvent.id == event_pk))
+        logger.info("event not claimable, skipping", extra={"event_pk": event_pk, "status": current})
+        return ProcessResult(Outcome.SKIPPED)
+
+    event = db.get(WebhookEvent, event_pk, populate_existing=True)
+    snapshot = _snapshot(event)
+    retry_count = event.retry_count
+    db.commit()  # end the read transaction; never hold one across the network call
+
+    log_extra = {"event_id": snapshot["event_id"], "attempt": retry_count + 1}
+    try:
+        downstream(snapshot)
+    except PermanentDownstreamError as exc:
+        logger.error("permanent downstream failure, marking FAILED", extra=log_extra)
+        _finalize(
+            db, event_pk, token,
+            status=EventStatus.FAILED.value,
+            retry_count=retry_count + 1,
+            error_message=_format_error(exc),
+            next_retry_at=None,
+        )
+        return ProcessResult(Outcome.FAILED)
+    except Exception as exc:  # transient or unexpected: both are worth retrying
+        failures = retry_count + 1
+        error = _format_error(exc)
+        if failures > settings.max_retries:
+            logger.error("retries exhausted, marking FAILED", extra={**log_extra, "error": error})
+            _finalize(
+                db, event_pk, token,
+                status=EventStatus.FAILED.value,
+                retry_count=failures,
+                error_message=error,
+                next_retry_at=None,
+            )
+            return ProcessResult(Outcome.FAILED)
+
+        delay = compute_backoff(failures, settings)
+        logger.warning("processing failed, scheduling retry", extra={**log_extra, "error": error, "retry_in": delay})
+        owned = _finalize(
+            db, event_pk, token,
+            status=EventStatus.RETRYING.value,
+            retry_count=failures,
+            error_message=error,
+            next_retry_at=utcnow() + timedelta(seconds=delay),
+        )
+        return ProcessResult(Outcome.RETRY, retry_in_seconds=delay) if owned else ProcessResult(Outcome.SKIPPED)
+
+    owned = _finalize(
+        db, event_pk, token,
+        status=EventStatus.PROCESSED.value,
+        processed_at=utcnow(),
+        error_message=None,
+        next_retry_at=None,
+    )
+    if owned:
+        logger.info("event processed", extra=log_extra)
+        return ProcessResult(Outcome.PROCESSED)
+    return ProcessResult(Outcome.SKIPPED)
+
+
+def find_stalled_event_ids(db: Session, settings: Settings | None = None, now: datetime | None = None) -> list[int]:
+    """Events whose queue message was probably lost and need re-enqueueing.
+
+    - RECEIVED for longer than the grace period (publish failed / message lost)
+    - RETRYING whose retry time passed more than the grace period ago
+    - PROCESSING with an expired lease (worker died mid-task)
+    """
+    settings = settings or get_settings()
+    now = now or utcnow()
+    grace = timedelta(seconds=settings.sweeper_grace_seconds)
+    lease = timedelta(seconds=settings.processing_lease_seconds)
+    stmt = (
+        select(WebhookEvent.id)
+        .where(
+            or_(
+                and_(WebhookEvent.status == EventStatus.RECEIVED.value, WebhookEvent.updated_at < now - grace),
+                and_(WebhookEvent.status == EventStatus.RETRYING.value, WebhookEvent.next_retry_at < now - grace),
+                and_(WebhookEvent.status == EventStatus.PROCESSING.value, WebhookEvent.locked_at < now - lease),
+            )
+        )
+        .order_by(WebhookEvent.id)
+        .limit(settings.sweeper_batch_size)
+    )
+    return list(db.scalars(stmt))
+
+
+def _format_error(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_LENGTH]
+
+
+==========================================================================================
+FILE: app/worker.py
+==========================================================================================
+"""Celery application and tasks.
+
+Run a worker:   celery -A app.worker worker --loglevel=INFO   (add --pool=solo on Windows)
+Run the beat:   celery -A app.worker beat --loglevel=INFO      (schedules the sweeper)
+"""
+import logging
+
+from celery import Celery, signals
+
+from .config import get_settings
+from .databases import session_scope
+from .logging_config import configure_logging
+from .processing import Outcome, find_stalled_event_ids, process_event
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+PROCESS_EVENT_TASK = "webhooks.process_event"
+SWEEP_TASK = "webhooks.requeue_stalled_events"
+
+celery_app = Celery("webhook_service", broker=settings.celery_broker_url)
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    # We track results in our own table; a result backend would be redundant.
+    task_ignore_result=True,
+    # Ack only after the task finishes, so a worker crash causes redelivery
+    # instead of a lost event. Safe because processing is idempotent.
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    # Don't let one worker hoard messages it can't start yet.
+    worker_prefetch_multiplier=1,
+    task_always_eager=settings.celery_task_always_eager,
+    task_eager_propagates=True,
+    broker_connection_retry_on_startup=True,
+    # Fail fast when the broker is down so the API isn't blocked; the sweeper
+    # picks up anything that couldn't be published.
+    broker_transport_options={"max_retries": 2, "interval_start": 0, "interval_step": 0.5, "interval_max": 1},
+    beat_schedule={
+        "requeue-stalled-events": {
+            "task": SWEEP_TASK,
+            "schedule": float(settings.sweeper_interval_seconds),
+        }
+    },
+    timezone="UTC",
+)
+
+
+@signals.setup_logging.connect
+def _setup_worker_logging(**_kwargs) -> None:
+    # Same JSON log format as the API instead of Celery's default handlers.
+    configure_logging(settings.log_level)
+
+
+@celery_app.task(name=PROCESS_EVENT_TASK)
+def process_event_task(event_pk: int) -> str:
+    with session_scope() as db:
+        result = process_event(db, event_pk)
+    if result.outcome is Outcome.RETRY:
+        # The retry limit and attempt history live in the database (retry_count),
+        # so they survive redeliveries and worker restarts. Celery only schedules
+        # the delayed re-run; if that publish fails, the sweeper picks the event
+        # up once next_retry_at has passed.
+        try:
+            process_event_task.apply_async((event_pk,), countdown=result.retry_in_seconds)
+        except Exception:
+            logger.exception("failed to schedule retry; sweeper will retry", extra={"event_pk": event_pk})
+    return result.outcome.value
+
+
+@celery_app.task(name=SWEEP_TASK)
+def requeue_stalled_events() -> int:
+    with session_scope() as db:
+        ids = find_stalled_event_ids(db)
+    for event_pk in ids:
+        process_event_task.delay(event_pk)
+    if ids:
+        logger.warning("re-enqueued stalled events", extra={"count": len(ids)})
+    return len(ids)
+
+
+def enqueue_event(event_pk: int) -> bool:
+    """Publish an event for processing. Never raises: the row is already
+    durably stored, so a publish failure is recovered by the sweeper."""
+    try:
+        process_event_task.delay(event_pk)
+        return True
+    except Exception:
+        logger.exception("failed to enqueue event; sweeper will retry", extra={"event_pk": event_pk})
+        return False
+
+
+==========================================================================================
+FILE: app/downstream.py
+==========================================================================================
+"""Simulated downstream order service (stands in for an external HTTP API).
+
+Real integrations should map HTTP 5xx / timeouts / connection errors to
+TransientDownstreamError and 4xx validation errors to PermanentDownstreamError,
+and pass ``event_id`` as an idempotency key so a retried call after an
+ambiguous failure (e.g. timeout after the remote committed) is not applied twice.
+"""
+import logging
+import random
+import time
+from typing import Any
+
+from .config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class DownstreamError(Exception):
+    """Base class for downstream failures."""
+
+
+class TransientDownstreamError(DownstreamError):
+    """Temporary failure (timeout, 5xx, rate limit) - safe to retry."""
+
+
+class PermanentDownstreamError(DownstreamError):
+    """Failure that retrying cannot fix (rejected payload, unknown shop)."""
+
+
+def send_order_event(event: dict[str, Any]) -> None:
+    settings = get_settings()
+    if settings.downstream_latency_seconds:
+        time.sleep(settings.downstream_latency_seconds)
+
+    if random.random() < settings.downstream_failure_rate:
+        raise TransientDownstreamError("downstream order service unavailable (simulated)")
+
+    logger.info(
+        "downstream accepted event",
+        extra={"event_id": event["event_id"], "event_type": event["event_type"], "shop_id": event["shop_id"]},
+    )
+
+
+==========================================================================================
+FILE: app/logging_config.py
+==========================================================================================
+"""Structured logging: one JSON object per line, including ``extra={...}`` fields,
+so logs can be shipped to and queried in any log platform."""
+import json
+import logging
+
+_STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "taskName"}
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        entry.update({k: v for k, v in vars(record).items() if k not in _STANDARD_ATTRS})
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(level.upper())
+
+
+==========================================================================================
+FILE: migrations/env.py
+==========================================================================================
+from logging.config import fileConfig
+
+from alembic import context
+
+from app.config import get_settings
+from app.databases import Base, engine
+from app import models  # noqa: F401  - registers tables on Base.metadata
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """Emit SQL to stdout (`alembic upgrade head --sql`) without a DB connection."""
+    context.configure(
+        url=get_settings().database_url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        render_as_batch=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    with engine.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            # SQLite can't ALTER most things; batch mode recreates tables instead.
+            render_as_batch=connection.dialect.name == "sqlite",
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+
+==========================================================================================
+FILE: migrations/versions/0001_create_webhook_events.py
+==========================================================================================
+"""create webhook_events
+
+Revision ID: 0001
+Revises:
+Create Date: 2026-10-08
+"""
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision = "0001"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+utc_datetime = sa.DateTime(timezone=True)
+
+
+def upgrade() -> None:
+    op.create_table(
+        "webhook_events",
+        sa.Column("id", sa.BigInteger().with_variant(sa.Integer(), "sqlite"), primary_key=True, autoincrement=True),
+        sa.Column("event_id", sa.String(100), nullable=False),
+        sa.Column("shop_id", sa.String(100), nullable=False),
+        sa.Column("event_type", sa.String(100), nullable=False),
+        sa.Column("occurred_at", utc_datetime, nullable=False),
+        sa.Column("payload", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False, server_default="RECEIVED"),
+        sa.Column("retry_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("next_retry_at", utc_datetime, nullable=True),
+        sa.Column("locked_at", utc_datetime, nullable=True),
+        sa.Column("lock_token", sa.String(36), nullable=True),
+        sa.Column("created_at", utc_datetime, nullable=False),
+        sa.Column("updated_at", utc_datetime, nullable=False),
+        sa.Column("processed_at", utc_datetime, nullable=True),
+        sa.UniqueConstraint("event_id", name="uq_webhook_events_event_id"),
+        sa.CheckConstraint(
+            "status IN ('RECEIVED','PROCESSING','RETRYING','PROCESSED','FAILED')",
+            name="ck_webhook_events_status",
+        ),
+        sa.CheckConstraint("retry_count >= 0", name="ck_webhook_events_retry_count"),
+    )
+    op.create_index("ix_webhook_events_status_updated_at", "webhook_events", ["status", "updated_at"])
+    op.create_index("ix_webhook_events_shop_id_created_at", "webhook_events", ["shop_id", "created_at"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_webhook_events_shop_id_created_at", table_name="webhook_events")
+    op.drop_index("ix_webhook_events_status_updated_at", table_name="webhook_events")
+    op.drop_table("webhook_events")
+
+
+==========================================================================================
+FILE: tests/__init__.py
+==========================================================================================
+(empty file)
+
+
+==========================================================================================
+FILE: tests/conftest.py
+==========================================================================================
+import json
+import os
+import tempfile
+from pathlib import Path
+
+# Configure the app *before* it is imported: settings and the engine are
+# created at import time. Environment variables take precedence over .env.
+_TMP_DIR = Path(tempfile.mkdtemp(prefix="webhook-tests-"))
+os.environ.update(
+    {
+        "DATABASE_URL": f"sqlite:///{(_TMP_DIR / 'test.db').as_posix()}",
+        "WEBHOOK_SECRET": "test-secret-0123456789abcdef",
+        "CELERY_BROKER_URL": "memory://",
+        "CELERY_TASK_ALWAYS_EAGER": "false",
+        "DOWNSTREAM_FAILURE_RATE": "0",
+        "DOWNSTREAM_LATENCY_SECONDS": "0",
+        "MAX_RETRIES": "3",
+        "LOG_LEVEL": "WARNING",
+    }
+)
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app import main  # noqa: E402
+from app.config import get_settings  # noqa: E402
+from app.databases import Base, SessionLocal, engine  # noqa: E402
+from app.security import compute_signature  # noqa: E402
+
+SECRET = os.environ["WEBHOOK_SECRET"]
+
+
+@pytest.fixture(autouse=True)
+def fresh_schema():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    yield
+    engine.dispose()
+
+
+@pytest.fixture
+def settings():
+    return get_settings()
+
+
+@pytest.fixture
+def db():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture
+def enqueued(monkeypatch):
+    """Capture what the API publishes instead of talking to a broker."""
+    published: list[int] = []
+
+    def fake_enqueue(event_pk: int) -> bool:
+        published.append(event_pk)
+        return True
+
+    monkeypatch.setattr(main, "enqueue_event", fake_enqueue)
+    return published
+
+
+@pytest.fixture
+def client():
+    with TestClient(main.app) as test_client:
+        yield test_client
+
+
+def make_payload(**overrides) -> dict:
+    payload = {
+        "event_id": "evt_10001",
+        "event_type": "order.created",
+        "shop_id": "shop_123",
+        "timestamp": "2026-08-18T10:30:00Z",
+        "data": {"order_id": "ORD-1001", "customer_id": "CUS-1001", "amount": 2500},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def post_webhook(client, payload: dict | bytes, signature: str | None = "auto", path: str = "/webhooks/order"):
+    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if signature == "auto":
+        signature = compute_signature(body, SECRET)
+    if signature is not None:
+        headers["X-Webhook-Signature"] = signature
+    return client.post(path, content=body, headers=headers)
+
+
+==========================================================================================
+FILE: tests/test_api.py
+==========================================================================================
+import json
+
+import pytest
+from sqlalchemy import func, select
+
+from app import worker
+from app.models import EventStatus, WebhookEvent
+from app.security import compute_signature
+
+from .conftest import SECRET, make_payload, post_webhook
+
+
+def count_events(db) -> int:
+    return db.scalar(select(func.count()).select_from(WebhookEvent))
+
+
+def test_valid_webhook_is_stored_and_enqueued(client, db, enqueued):
+    response = post_webhook(client, make_payload())
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "event_id": "evt_10001",
+        "status": "RECEIVED",
+        "duplicate": False,
+        "message": "Webhook accepted",
+    }
+    event = db.scalar(select(WebhookEvent).where(WebhookEvent.event_id == "evt_10001"))
+    assert event.status == EventStatus.RECEIVED.value
+    assert event.shop_id == "shop_123"
+    assert event.event_type == "order.created"
+    assert event.retry_count == 0
+    assert event.payload == make_payload()
+    assert event.occurred_at.isoformat() == "2026-08-18T10:30:00+00:00"
+    assert enqueued == [event.id]
+
+
+def test_signature_with_sha256_prefix_is_accepted(client, enqueued):
+    body = json.dumps(make_payload()).encode()
+    response = post_webhook(client, body, signature="sha256=" + compute_signature(body, SECRET))
+    assert response.status_code == 202
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [None, "", "not-a-signature", "0" * 64, compute_signature(b"other body", SECRET)],
+    ids=["missing", "empty", "garbage", "zeros", "signature-of-other-body"],
+)
+def test_invalid_signature_is_rejected(client, db, enqueued, signature):
+    response = post_webhook(client, make_payload(), signature=signature)
+
+    assert response.status_code == 401
+    assert count_events(db) == 0
+    assert enqueued == []
+
+
+def test_signature_with_wrong_secret_is_rejected(client, db, enqueued):
+    body = json.dumps(make_payload()).encode()
+    response = post_webhook(client, body, signature=compute_signature(body, "some-other-secret-value"))
+    assert response.status_code == 401
+    assert count_events(db) == 0
+
+
+def test_tampered_body_is_rejected(client, db, enqueued):
+    original = json.dumps(make_payload()).encode()
+    tampered = original.replace(b"2500", b"1")
+    response = post_webhook(client, tampered, signature=compute_signature(original, SECRET))
+    assert response.status_code == 401
+    assert count_events(db) == 0
+
+
+def test_signature_is_checked_before_payload_validation(client, enqueued):
+    # An unauthenticated caller must not learn anything about our validation rules.
+    response = post_webhook(client, {"junk": True}, signature="bad")
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        make_payload(event_id=""),
+        make_payload(event_id="x" * 101),
+        make_payload(event_type="refund.created"),
+        make_payload(timestamp="not-a-date"),
+        make_payload(timestamp="2026-08-18T10:30:00"),  # naive timestamp
+        make_payload(data={"order_id": "ORD-1", "customer_id": "CUS-1", "amount": -1}),
+        make_payload(data={"order_id": "ORD-1", "customer_id": "CUS-1"}),
+        {k: v for k, v in make_payload().items() if k != "shop_id"},
+    ],
+    ids=["empty-id", "long-id", "wrong-type", "bad-date", "naive-date", "negative-amount", "no-amount", "no-shop"],
+)
+def test_invalid_payload_with_valid_signature_returns_422(client, db, enqueued, payload):
+    response = post_webhook(client, payload)
+    assert response.status_code == 422
+    assert count_events(db) == 0
+    assert enqueued == []
+
+
+@pytest.mark.parametrize("body", [b"{not json", b"[1, 2, 3]"])
+def test_non_object_json_is_rejected(client, db, enqueued, body):
+    response = post_webhook(client, body)
+    assert response.status_code in (400, 422)
+    assert count_events(db) == 0
+
+
+def test_oversized_body_is_rejected(client, db, enqueued, settings):
+    payload = make_payload(data={"order_id": "O", "customer_id": "C", "amount": 1, "note": "x" * settings.max_body_bytes})
+    response = post_webhook(client, payload)
+    assert response.status_code == 413
+    assert count_events(db) == 0
+
+
+def test_duplicate_event_id_is_stored_and_enqueued_once(client, db, enqueued):
+    first = post_webhook(client, make_payload())
+    second = post_webhook(client, make_payload())
+
+    assert first.status_code == 202
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+    assert second.json()["message"] == "Event already received"
+    assert count_events(db) == 1
+    assert len(enqueued) == 1
+
+
+def test_duplicate_reports_current_status(client, db, enqueued):
+    post_webhook(client, make_payload())
+    event = db.scalar(select(WebhookEvent))
+    event.status = EventStatus.PROCESSED.value
+    db.commit()
+
+    response = post_webhook(client, make_payload())
+    assert response.status_code == 200
+    assert response.json()["status"] == "PROCESSED"
+
+
+def test_broker_outage_still_accepts_event(client, db, monkeypatch):
+    """The event is committed before publishing; a broker failure must not lose
+    it or fail the request - the sweeper re-enqueues it later."""
+
+    def broker_down(*args, **kwargs):
+        raise ConnectionError("broker unreachable")
+
+    monkeypatch.setattr(worker.process_event_task, "delay", broker_down)
+
+    response = post_webhook(client, make_payload())
+
+    assert response.status_code == 202
+    event = db.scalar(select(WebhookEvent))
+    assert event.status == EventStatus.RECEIVED.value
+
+
+def test_legacy_route_still_works(client, enqueued):
+    response = post_webhook(client, make_payload(), path="/webhook/orders")
+    assert response.status_code == 202
+
+
+def test_event_status_endpoint(client, enqueued):
+    assert client.get("/webhooks/events/evt_10001").status_code == 404
+
+    post_webhook(client, make_payload())
+    response = client.get("/webhooks/events/evt_10001")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "RECEIVED"
+    assert body["retry_count"] == 0
+    assert "payload" not in body
+
+
+def test_health_and_root(client):
+    assert client.get("/health").json() == {"status": "ok", "database": "ok"}
+    assert client.get("/").json() == {"message": "Webhook running"}
+
+
+==========================================================================================
+FILE: tests/test_processing.py
+==========================================================================================
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.downstream import PermanentDownstreamError, TransientDownstreamError
+from app.models import EventStatus, WebhookEvent, utcnow
+from app.processing import (
+    Outcome,
+    _finalize,
+    claim_event,
+    compute_backoff,
+    find_stalled_event_ids,
+    process_event,
+)
+
+
+def create_event(db, event_id="evt_1", **fields) -> WebhookEvent:
+    event = WebhookEvent(
+        event_id=event_id,
+        shop_id="shop_1",
+        event_type="order.created",
+        occurred_at=datetime(2026, 8, 18, 10, 30, tzinfo=timezone.utc),
+        payload={"event_id": event_id},
+        **fields,
+    )
+    db.add(event)
+    db.commit()
+    return event
+
+
+def reload(db, event: WebhookEvent) -> WebhookEvent:
+    db.expire_all()
+    return db.get(WebhookEvent, event.id)
+
+
+class FakeDownstream:
+    """Fails with the given exceptions in order, then succeeds."""
+
+    def __init__(self, *failures: Exception):
+        self.failures = list(failures)
+        self.calls: list[dict] = []
+
+    def __call__(self, event: dict) -> None:
+        self.calls.append(event)
+        if self.failures:
+            raise self.failures.pop(0)
+
+
+def test_successful_processing(db, settings):
+    event = create_event(db)
+    downstream = FakeDownstream()
+
+    result = process_event(db, event.id, downstream=downstream, settings=settings)
+
+    assert result.outcome is Outcome.PROCESSED
+    event = reload(db, event)
+    assert event.status == EventStatus.PROCESSED.value
+    assert event.processed_at is not None
+    assert event.retry_count == 0
+    assert event.error_message is None
+    assert event.lock_token is None and event.locked_at is None
+    assert downstream.calls == [
+        {"event_id": "evt_1", "event_type": "order.created", "shop_id": "shop_1", "payload": {"event_id": "evt_1"}}
+    ]
+
+
+def test_transient_failure_is_recorded_then_retried_successfully(db, settings):
+    event = create_event(db)
+    downstream = FakeDownstream(TransientDownstreamError("timeout"))
+
+    first = process_event(db, event.id, downstream=downstream, settings=settings)
+
+    assert first.outcome is Outcome.RETRY
+    assert first.retry_in_seconds >= 1
+    event = reload(db, event)
+    assert event.status == EventStatus.RETRYING.value
+    assert event.retry_count == 1
+    assert event.error_message == "TransientDownstreamError: timeout"
+    assert event.next_retry_at > utcnow()
+
+    second = process_event(db, event.id, downstream=downstream, settings=settings)
+
+    assert second.outcome is Outcome.PROCESSED
+    event = reload(db, event)
+    assert event.status == EventStatus.PROCESSED.value
+    assert event.retry_count == 1  # history of the failed attempt is kept
+    assert event.error_message is None
+    assert event.next_retry_at is None
+    assert len(downstream.calls) == 2
+
+
+def test_unexpected_exceptions_are_retried(db, settings):
+    event = create_event(db)
+    result = process_event(db, event.id, downstream=FakeDownstream(KeyError("boom")), settings=settings)
+    assert result.outcome is Outcome.RETRY
+    assert reload(db, event).error_message == "KeyError: 'boom'"
+
+
+def test_marked_failed_after_retry_limit(db, settings):
+    assert settings.max_retries == 3
+    event = create_event(db)
+    downstream = FakeDownstream(*[TransientDownstreamError(f"attempt {i}") for i in range(10)])
+
+    outcomes = [process_event(db, event.id, downstream=downstream, settings=settings).outcome for _ in range(4)]
+
+    assert outcomes == [Outcome.RETRY, Outcome.RETRY, Outcome.RETRY, Outcome.FAILED]
+    event = reload(db, event)
+    assert event.status == EventStatus.FAILED.value
+    assert event.retry_count == 4  # 1 initial attempt + 3 retries
+    assert event.error_message == "TransientDownstreamError: attempt 3"
+    assert event.next_retry_at is None
+
+    # FAILED is terminal: further deliveries do nothing.
+    assert process_event(db, event.id, downstream=downstream, settings=settings).outcome is Outcome.SKIPPED
+    assert len(downstream.calls) == 4
+
+
+def test_permanent_failure_is_not_retried(db, settings):
+    event = create_event(db)
+    downstream = FakeDownstream(PermanentDownstreamError("unknown shop"))
+
+    result = process_event(db, event.id, downstream=downstream, settings=settings)
+
+    assert result.outcome is Outcome.FAILED
+    event = reload(db, event)
+    assert event.status == EventStatus.FAILED.value
+    assert event.retry_count == 1
+    assert event.error_message == "PermanentDownstreamError: unknown shop"
+
+
+def test_processed_event_is_not_processed_again(db, settings):
+    event = create_event(db)
+    downstream = FakeDownstream()
+
+    assert process_event(db, event.id, downstream=downstream, settings=settings).outcome is Outcome.PROCESSED
+    assert process_event(db, event.id, downstream=downstream, settings=settings).outcome is Outcome.SKIPPED
+    assert len(downstream.calls) == 1
+
+
+def test_event_in_flight_elsewhere_is_skipped(db, settings):
+    event = create_event(db)
+    assert claim_event(db, event.id, settings) is not None
+    downstream = FakeDownstream()
+
+    assert process_event(db, event.id, downstream=downstream, settings=settings).outcome is Outcome.SKIPPED
+    assert downstream.calls == []
+
+
+def test_missing_event_is_skipped(db, settings):
+    assert process_event(db, 999, downstream=FakeDownstream(), settings=settings).outcome is Outcome.SKIPPED
+
+
+def test_expired_lease_is_reclaimed_and_stale_worker_is_fenced_off(db, settings):
+    event = create_event(db)
+    stale_token = claim_event(db, event.id, settings)
+
+    # Simulate the first worker hanging past its lease.
+    event = reload(db, event)
+    event.locked_at = utcnow() - timedelta(seconds=settings.processing_lease_seconds + 1)
+    db.commit()
+
+    new_token = claim_event(db, event.id, settings)
+    assert new_token is not None and new_token != stale_token
+
+    # The stale worker wakes up and tries to record its result: rejected.
+    assert _finalize(db, event.id, stale_token, status=EventStatus.FAILED.value) is False
+    assert reload(db, event).status == EventStatus.PROCESSING.value
+
+    assert _finalize(db, event.id, new_token, status=EventStatus.PROCESSED.value) is True
+    assert reload(db, event).status == EventStatus.PROCESSED.value
+
+
+def test_find_stalled_events(db, settings):
+    now = utcnow()
+    long_ago = now - timedelta(seconds=settings.sweeper_grace_seconds + settings.processing_lease_seconds + 60)
+
+    fresh = create_event(db, "fresh")
+    stuck_received = create_event(db, "stuck_received", updated_at=long_ago)
+    due_retry = create_event(db, "due_retry", status="RETRYING", next_retry_at=long_ago)
+    future_retry = create_event(db, "future_retry", status="RETRYING", next_retry_at=now + timedelta(minutes=5))
+    dead_worker = create_event(db, "dead_worker", status="PROCESSING", locked_at=long_ago, lock_token="t")
+    live_worker = create_event(db, "live_worker", status="PROCESSING", locked_at=now, lock_token="t")
+    done = create_event(db, "done", status="PROCESSED", updated_at=long_ago)
+    failed = create_event(db, "failed", status="FAILED", updated_at=long_ago)
+
+    stalled = set(find_stalled_event_ids(db, settings, now=now))
+
+    assert stalled == {stuck_received.id, due_retry.id, dead_worker.id}
+    assert not stalled & {fresh.id, future_retry.id, live_worker.id, done.id, failed.id}
+
+
+@pytest.mark.parametrize("retry_count", [1, 2, 5, 20])
+def test_backoff_is_bounded(settings, retry_count):
+    ceiling = min(settings.retry_backoff_max_seconds, settings.retry_backoff_base_seconds * 2 ** (retry_count - 1))
+    for _ in range(50):
+        assert 1.0 <= compute_backoff(retry_count, settings) <= max(1.0, ceiling)
+
+
+==========================================================================================
+FILE: tests/test_concurrency.py
+==========================================================================================
+"""Concurrency / idempotency: many threads racing on the same event, each with
+its own DB session (= its own connection), like separate API instances or workers."""
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from sqlalchemy import func, select
+
+from app.databases import SessionLocal
+from app.ingest import store_event
+from app.models import EventStatus, WebhookEvent
+from app.processing import Outcome, claim_event, process_event
+from app.schemas import WebhookRequest
+
+from .conftest import make_payload
+from .test_processing import create_event
+
+THREADS = 8
+
+
+def run_concurrently(fn, n=THREADS):
+    barrier = threading.Barrier(n)
+
+    def task(i):
+        barrier.wait()  # release all threads at the same moment
+        return fn(i)
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        return list(pool.map(task, range(n)))
+
+
+def test_concurrent_duplicate_deliveries_store_exactly_one_row(db):
+    payload = make_payload()
+    webhook = WebhookRequest.model_validate(payload)
+
+    def deliver(_):
+        session = SessionLocal()
+        try:
+            return store_event(session, webhook, payload).created
+        finally:
+            session.close()
+
+    created = run_concurrently(deliver)
+
+    assert created.count(True) == 1
+    assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 1
+
+
+def test_only_one_worker_can_claim_an_event(db, settings):
+    event = create_event(db)
+
+    def claim(_):
+        session = SessionLocal()
+        try:
+            return claim_event(session, event.id, settings)
+        finally:
+            session.close()
+
+    tokens = run_concurrently(claim)
+
+    assert sum(token is not None for token in tokens) == 1
+
+
+def test_duplicate_task_deliveries_call_downstream_once(db, settings):
+    event = create_event(db)
+    calls = []
+    lock = threading.Lock()
+
+    def downstream(snapshot):
+        with lock:
+            calls.append(snapshot["event_id"])
+
+    def work(_):
+        session = SessionLocal()
+        try:
+            return process_event(session, event.id, downstream=downstream, settings=settings).outcome
+        finally:
+            session.close()
+
+    outcomes = run_concurrently(work)
+
+    assert outcomes.count(Outcome.PROCESSED) == 1
+    assert outcomes.count(Outcome.SKIPPED) == THREADS - 1
+    assert calls == ["evt_1"]
+    db.expire_all()
+    assert db.get(WebhookEvent, event.id).status == EventStatus.PROCESSED.value
+
+
+==========================================================================================
+FILE: tests/test_worker.py
+==========================================================================================
+"""End-to-end through the real Celery task, executed eagerly (in-process)."""
+from datetime import timedelta
+
+import pytest
+from sqlalchemy import select
+
+from app import processing, worker
+from app.downstream import TransientDownstreamError
+from app.models import EventStatus, WebhookEvent, utcnow
+
+from .conftest import make_payload, post_webhook
+from .test_processing import FakeDownstream, create_event
+
+
+@pytest.fixture
+def eager_celery():
+    conf = worker.celery_app.conf
+    previous = conf.task_always_eager
+    conf.task_always_eager = True
+    yield
+    conf.task_always_eager = previous
+
+
+def test_webhook_is_processed_by_worker(client, db, eager_celery, monkeypatch):
+    downstream = FakeDownstream()
+    monkeypatch.setattr(processing, "send_order_event", downstream)
+
+    response = post_webhook(client, make_payload())
+
+    assert response.status_code == 202
+    event = db.scalar(select(WebhookEvent))
+    assert event.status == EventStatus.PROCESSED.value
+    assert len(downstream.calls) == 1
+
+
+def test_worker_retries_transient_failures_until_success(client, db, eager_celery, monkeypatch):
+    downstream = FakeDownstream(TransientDownstreamError("503"), TransientDownstreamError("503"))
+    monkeypatch.setattr(processing, "send_order_event", downstream)
+
+    post_webhook(client, make_payload())
+
+    event = db.scalar(select(WebhookEvent))
+    assert event.status == EventStatus.PROCESSED.value
+    assert event.retry_count == 2
+    assert len(downstream.calls) == 3
+
+
+def test_worker_gives_up_after_retry_limit(client, db, eager_celery, monkeypatch, settings):
+    downstream = FakeDownstream(*[TransientDownstreamError("503")] * 10)
+    monkeypatch.setattr(processing, "send_order_event", downstream)
+
+    post_webhook(client, make_payload())
+
+    event = db.scalar(select(WebhookEvent))
+    assert event.status == EventStatus.FAILED.value
+    assert event.retry_count == settings.max_retries + 1
+    assert len(downstream.calls) == settings.max_retries + 1
+
+
+def test_sweeper_requeues_stalled_events(db, monkeypatch):
+    stuck = create_event(db, "stuck", updated_at=utcnow() - timedelta(hours=1))
+    create_event(db, "fresh")
+    published = []
+    monkeypatch.setattr(worker.process_event_task, "delay", published.append)
+
+    assert worker.requeue_stalled_events() == 1
+    assert published == [stuck.id]
+
+
+==========================================================================================
+FILE: scripts/send_webhook.py
+==========================================================================================
+"""Send a signed sample webhook to a running service.
+
+    python scripts/send_webhook.py                      # evt_<random>
+    python scripts/send_webhook.py --event-id evt_10001 # repeat to see duplicate handling
+    python scripts/send_webhook.py --bad-signature      # expect 401
+"""
+import argparse
+import json
+import sys
+import uuid
+from pathlib import Path
+
+import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.config import get_settings  # noqa: E402
+from app.security import compute_signature  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="http://127.0.0.1:8000/webhooks/order")
+    parser.add_argument("--event-id", default=f"evt_{uuid.uuid4().hex[:10]}")
+    parser.add_argument("--shop-id", default="shop_123")
+    parser.add_argument("--amount", type=float, default=2500)
+    parser.add_argument("--bad-signature", action="store_true")
+    args = parser.parse_args()
+
+    payload = {
+        "event_id": args.event_id,
+        "event_type": "order.created",
+        "shop_id": args.shop_id,
+        "timestamp": "2026-08-18T10:30:00Z",
+        "data": {"order_id": "ORD-1001", "customer_id": "CUS-1001", "amount": args.amount},
+    }
+    body = json.dumps(payload).encode()
+    signature = "deadbeef" if args.bad_signature else compute_signature(body)
+    settings = get_settings()
+    response = httpx.post(
+        args.url,
+        content=body,
+        headers={"Content-Type": "application/json", settings.signature_header: f"sha256={signature}"},
+    )
+    print(response.status_code, response.text)
+
+
+if __name__ == "__main__":
+    main()
+
+
+==========================================================================================
+FILE: .env.example
+==========================================================================================
+# Copy to .env and adjust. Never commit a real .env.
+
+# Shared HMAC secret agreed with the sender (min 16 chars). Generate one with:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+WEBHOOK_SECRET=replace-with-a-long-random-secret
+
+# SQLite for local development; PostgreSQL for anything shared/production.
+DATABASE_URL=sqlite:///./webhook.db
+# DATABASE_URL=postgresql+psycopg://webhooks:webhooks@localhost:5432/webhooks
+
+# Celery broker. Redis (docker compose) is the default; the SQLAlchemy broker
+# needs no extra services and is handy for a quick local run.
+CELERY_BROKER_URL=redis://localhost:6379/0
+# CELERY_BROKER_URL=sqla+sqlite:///./celery-broker.db
+CELERY_TASK_ALWAYS_EAGER=false
+
+# Retry policy: 1 attempt + MAX_RETRIES retries, exponential backoff with jitter.
+MAX_RETRIES=5
+RETRY_BACKOFF_BASE_SECONDS=2
+RETRY_BACKOFF_MAX_SECONDS=300
+PROCESSING_LEASE_SECONDS=300
+
+# Sweeper (celery beat) re-enqueues events whose queue message was lost.
+SWEEPER_INTERVAL_SECONDS=60
+SWEEPER_GRACE_SECONDS=120
+SWEEPER_BATCH_SIZE=500
+
+# Simulated downstream service: probability (0..1) of a transient failure.
+DOWNSTREAM_FAILURE_RATE=0.2
+DOWNSTREAM_LATENCY_SECONDS=0.05
+
+MAX_BODY_BYTES=65536
+LOG_LEVEL=INFO
+
+
+==========================================================================================
+FILE: requirements.txt
+==========================================================================================
+fastapi==0.142.4
+uvicorn==0.54.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+SQLAlchemy==2.1.4
+alembic==1.20.0
+psycopg[binary]==3.3.6
+celery==5.6.3
+redis==8.1.0
+
+# tests
+pytest==9.1.1
+httpx==0.28.1
+
+
+==========================================================================================
+FILE: pytest.ini
+==========================================================================================
+[pytest]
+testpaths = tests
+addopts = -ra
+filterwarnings =
+    error::DeprecationWarning:app.*
+    ignore:Using `httpx` with `starlette.testclient` is deprecated
+
+
+==========================================================================================
+FILE: alembic.ini
+==========================================================================================
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts.
+# this is typically a path given in POSIX (e.g. forward slashes)
+# format, relative to the token %(here)s which refers to the location of this
+# ini file
+script_location = %(here)s/migrations
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+# Or organize into date-based subdirectories (requires recursive_version_locations = true)
+# file_template = %%(year)d/%%(month).2d/%%(day).2d_%%(hour).2d%%(minute).2d_%%(second).2d_%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.  for multiple paths, the path separator
+# is defined by "path_separator" below.
+prepend_sys_path = .
+
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the tzdata library which can be installed by adding
+# `alembic[tz]` to the pip requirements.
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to <script_location>/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "path_separator"
+# below.
+# version_locations = %(here)s/bar:%(here)s/bat:%(here)s/alembic/versions
+
+# path_separator; This indicates what character is used to split lists of file
+# paths, including version_locations and prepend_sys_path within configparser
+# files such as alembic.ini.
+# The default rendered in new alembic.ini files is "os", which uses os.pathsep
+# to provide os-dependent path splitting.
+#
+# Note that in order to support legacy alembic.ini files, this default does NOT
+# take place if path_separator is not present in alembic.ini.  If this
+# option is omitted entirely, fallback logic is as follows:
+#
+# 1. Parsing of the version_locations option falls back to using the legacy
+#    "version_path_separator" key, which if absent then falls back to the legacy
+#    behavior of splitting on spaces and/or commas.
+# 2. Parsing of the prepend_sys_path option falls back to the legacy
+#    behavior of splitting on spaces, commas, or colons.
+#
+# Valid values for path_separator are:
+#
+# path_separator = :
+# path_separator = ;
+# path_separator = space
+# path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+# database URL.  This is consumed by the user-maintained env.py script only.
+# other means of configuring database URLs may be customized within the env.py
+# file.
+# URL comes from DATABASE_URL (see app/config.py); set in migrations/env.py
+sqlalchemy.url =
+
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the module runner, against the "ruff" module
+# hooks = ruff
+# ruff.type = module
+# ruff.module = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Alternatively, use the exec runner to execute a binary found on your PATH
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration.  This is also consumed by the user-maintained
+# env.py script only.
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+
+==========================================================================================
+FILE: Dockerfile
+==========================================================================================
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /srv
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY migrations ./migrations
+COPY alembic.ini .
+
+RUN useradd --create-home appuser
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+==========================================================================================
+FILE: docker-compose.yml
+==========================================================================================
+# Full stack: PostgreSQL + Redis + API + worker + beat (sweeper).
+#   cp .env.example .env    # set WEBHOOK_SECRET
+#   docker compose up --build
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://webhooks:webhooks@postgres:5432/webhooks
+    CELERY_BROKER_URL: redis://redis:6379/0
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: webhooks
+      POSTGRES_PASSWORD: webhooks   # local development only
+      POSTGRES_DB: webhooks
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhooks"]
+      interval: 2s
+      retries: 20
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 20
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    <<: *app
+    command: ["celery", "-A", "app.worker", "worker", "--loglevel=INFO", "--concurrency=4"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "app.worker", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+
+==========================================================================================
+FILE: .gitignore
+==========================================================================================
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.db
+*.db-shm
+*.db-wal
+celerybeat-schedule*
+
+
+==========================================================================================
+FILE: .dockerignore
+==========================================================================================
+venv/
+.venv/
+.env
+*.db
+*.db-*
+__pycache__/
+.pytest_cache/
+tests/
+
+
+==========================================================================================
+FILE: docs/schema.postgres.sql
+==========================================================================================
+BEGIN;
+
+CREATE TABLE alembic_version (
+    version_num VARCHAR(32) NOT NULL, 
+    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+);
+
+-- Running upgrade  -> 0001
+
+CREATE TABLE webhook_events (
+    id BIGSERIAL NOT NULL, 
+    event_id VARCHAR(100) NOT NULL, 
+    shop_id VARCHAR(100) NOT NULL, 
+    event_type VARCHAR(100) NOT NULL, 
+    occurred_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+    payload JSONB NOT NULL, 
+    status VARCHAR(20) DEFAULT 'RECEIVED' NOT NULL, 
+    retry_count INTEGER DEFAULT '0' NOT NULL, 
+    error_message TEXT, 
+    next_retry_at TIMESTAMP WITH TIME ZONE, 
+    locked_at TIMESTAMP WITH TIME ZONE, 
+    lock_token VARCHAR(36), 
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+    processed_at TIMESTAMP WITH TIME ZONE, 
+    PRIMARY KEY (id), 
+    CONSTRAINT uq_webhook_events_event_id UNIQUE (event_id), 
+    CONSTRAINT ck_webhook_events_status CHECK (status IN ('RECEIVED','PROCESSING','RETRYING','PROCESSED','FAILED')), 
+    CONSTRAINT ck_webhook_events_retry_count CHECK (retry_count >= 0)
+);
+
+CREATE INDEX ix_webhook_events_status_updated_at ON webhook_events (status, updated_at);
+
+CREATE INDEX ix_webhook_events_shop_id_created_at ON webhook_events (shop_id, created_at);
+
+INSERT INTO alembic_version (version_num) VALUES ('0001') RETURNING alembic_version.version_num;
+
+COMMIT;
+
+
+
+==========================================================================================
+FILE: docs/DESIGN.md
+==========================================================================================
+# Design Note
+
+## 1. Database design
+
+Table `webhook_events` (migration: [migrations/versions/0001_create_webhook_events.py](../migrations/versions/0001_create_webhook_events.py)):
+
+| Column | Type (Postgres) | Purpose |
+|---|---|---|
+| `id` | `BIGSERIAL` PK | Surrogate key: small, monotonic, cheap to index; used in queue messages |
+| `event_id` | `VARCHAR(100)` **UNIQUE** | Sender's idempotency key |
+| `shop_id`, `event_type` | `VARCHAR(100)` | Routing and filtering |
+| `occurred_at` | `TIMESTAMPTZ` | Sender's `timestamp` |
+| `payload` | `JSONB` | Full original body, for audit and replay |
+| `status` | `VARCHAR(20)` + CHECK | `RECEIVED / PROCESSING / RETRYING / PROCESSED / FAILED` |
+| `retry_count` | `INT` + CHECK ≥ 0 | Failed attempts so far |
+| `error_message` | `TEXT` | Last failure (truncated to 2,000 chars) |
+| `next_retry_at` | `TIMESTAMPTZ` | When the scheduled retry is due |
+| `locked_at`, `lock_token` | `TIMESTAMPTZ`, `VARCHAR(36)` | Worker lease and fencing token |
+| `created_at`, `updated_at`, `processed_at` | `TIMESTAMPTZ` | Lifecycle timestamps, all UTC |
+
+**Keys and constraints.** The PK is a `BIGINT` surrogate. `event_id` is a separate unique key because it's an external string of unknown format. A narrow integer PK keeps secondary indexes and queue messages small. `UNIQUE(event_id)` assumes the platform issues globally unique IDs. If IDs were only unique per shop, the constraint would become `UNIQUE(shop_id, event_id)`.
+
+**Indexes and the queries they serve:**
+
+| Index | Query |
+|---|---|
+| `uq_webhook_events_event_id` | Duplicate detection on insert; `GET /webhooks/events/{event_id}` |
+| PK `id` | Worker claim/finalize: `UPDATE … WHERE id = ?` |
+| `ix_webhook_events_status_updated_at` | Sweeper and ops: "events in status X older than T"; FAILED (dead-letter) listing |
+| `ix_webhook_events_shop_id_created_at` | Per-shop history and support lookups |
+
+Write cost was weighed against these: every index slows the hot `INSERT` path, so there are no single-column indexes on low-selectivity columns such as `status` alone.
+
+## 2. Preventing duplicates
+
+There are two layers, and only the database one is relied on for correctness:
+
+1. **Ingest:** the API does a plain `INSERT`. If two deliveries of the same event race on different API instances, the `UNIQUE` constraint lets exactly one commit. The other gets an `IntegrityError`, rolls back, reads the existing row and returns `200 duplicate` without enqueueing. The original code did "SELECT, then INSERT if missing". That has a race window where both requests see "missing", so it was replaced. This is covered by `test_concurrent_duplicate_deliveries_store_exactly_one_row`.
+2. **Processing:** the queue is at-least-once, so a task can run twice through redelivery after a crash, a sweeper re-enqueue or a duplicate publish. The worker therefore *claims* the row before doing anything (next section). `PROCESSED` and `FAILED` rows are never claimable, so re-running a task is a no-op.
+
+## 3. Concurrent workers
+
+```sql
+-- claim (one statement, atomic)
+UPDATE webhook_events
+   SET status='PROCESSING', locked_at=:now, lock_token=:uuid, updated_at=:now
+ WHERE id=:id
+   AND (status IN ('RECEIVED','RETRYING')
+        OR (status='PROCESSING' AND locked_at < :now - lease));
+-- rowcount = 1 → we own it; 0 → someone else does / it's done → skip
+```
+
+- The database serialises concurrent UPDATEs on a row, so exactly one worker gets `rowcount = 1`. This needs no `SELECT … FOR UPDATE` held across the network call, and it works on Postgres, MySQL and SQLite.
+- The downstream call happens **outside** any transaction, so no DB locks are held during slow I/O.
+- **Lease:** if a worker dies mid-task, the row stays `PROCESSING`. After `PROCESSING_LEASE_SECONDS` another worker, or the sweeper, may reclaim it.
+- **Fencing:** the final `UPDATE … WHERE id=:id AND status='PROCESSING' AND lock_token=:token` only succeeds for the current owner. A worker that stalled past its lease, for example during a long GC pause, can't overwrite the new owner's result. This is covered by `test_expired_lease_is_reclaimed_and_stale_worker_is_fenced_off`.
+- The retry limit is read from `retry_count` in the DB, not from Celery's in-memory retry counter. So it survives worker restarts and redeliveries.
+
+Celery settings that support this: `task_acks_late=True` and `task_reject_on_worker_lost=True` make a crash cause redelivery rather than loss, and `worker_prefetch_multiplier=1`.
+
+**Lost-message recovery (outbox-lite).** The row is committed *before* publishing. If the broker is down, the API still answers 202 and logs the failure. The beat-scheduled sweeper re-enqueues three kinds of event: `RECEIVED` older than the grace period, `RETRYING` past `next_retry_at`, and `PROCESSING` with an expired lease. Because claims are idempotent, an occasional double enqueue is harmless.
+
+## 4. When the table reaches tens of millions of rows
+
+- **Partition by time** with Postgres declarative range partitioning on `created_at`, one partition per day or week. Retention becomes `DROP PARTITION` instead of a huge `DELETE`. Because a unique index on a partitioned table must include the partition key, global dedup moves to a small, separate `processed_event_ids(event_id PK, created_at)` table. Alternatively, dedup only within a bounded window (senders don't redeliver after days) via Redis `SET NX` plus partition-local uniqueness.
+- **Keep the hot set small.** Workers and the sweeper only touch non-terminal rows. A **partial index** `ON (status, updated_at) WHERE status IN ('RECEIVED','RETRYING','PROCESSING')` stays tiny even when the table holds 100M `PROCESSED` rows.
+- **Archive** old payloads to object storage such as S3 or Parquet. Keep metadata online and drop `payload` from cold partitions.
+- **Read replicas** for status lookups and reporting, so the primary serves only ingest and claim writes.
+- `BIGINT` PK from the start (done), so the key never overflows.
+
+## 5. Scaling to about 10,000 requests per second
+
+**API instances.** The API is stateless: verify the HMAC, one INSERT, one publish. Run N replicas behind a load balancer with HPA on CPU and p99 latency. At roughly 500–1,000 req/s per instance (uvicorn plus several workers per pod), 10k req/s needs about 15–25 pods with headroom. Use PgBouncer in transaction mode so the replicas don't exhaust Postgres connections. Keep the request path minimal: no downstream calls and no extra reads.
+
+**Workers.** Workers scale horizontally and independently of the API. Autoscale on **queue depth and age**, for example with KEDA. Throughput ≈ workers × concurrency / downstream latency: at 100 ms latency, 10k/s needs about 1,000 concurrent slots. Use gevent or eventlet pools or async workers for I/O-bound calls. Use separate queues per priority, and shard by shop so one noisy shop can't starve the others. Enforce per-shop rate limits toward downstream.
+
+**If the database becomes the bottleneck:**
+1. Batch the hot path. Have the API publish straight to a durable log such as Kafka or Kinesis and return 202. Ingestion workers then write to the DB in batches with multi-row `INSERT … ON CONFLICT (event_id) DO NOTHING`, which cuts per-request round trips by 50–100x. Durability then comes from Kafka's replicated log rather than the DB commit.
+2. Use partitioning, the partial index and lean secondary indexes, as described in section 4.
+3. Add a Redis dedup front-check (`SET event_id NX EX 7d`) so most duplicates never reach the DB. The DB constraint stays as the source of truth.
+4. As a final option, **shard by `shop_id`** across Postgres clusters (or Citus). `event_id` is then looked up via the shop.
+
+**Duplicate events** are handled in three layers: the Redis `SET NX` fast path, the DB unique constraint as the authority, and the idempotent worker claim. The downstream call carries `event_id` as an idempotency key, which covers the "crashed after the side effect" gap.
+
+**Queue failures.** The commit happens before publish, and the sweeper recovers anything not published, so a broker outage delays processing but loses nothing. Run Redis with persistence and replication (Sentinel or ElastiCache), or move to RabbitMQ quorum queues or SQS for stronger delivery guarantees. With Kafka in front, the API keeps accepting even while the DB or workers are down.
+
+**Downstream failures.** Retries use exponential backoff with full jitter and a cap. Transient and permanent errors are classified separately. Add a **circuit breaker** per downstream so workers stop hammering a failing service and messages wait in the queue instead of burning retries. After `MAX_RETRIES`, events go to `FAILED`, the dead letter, with the error recorded, and a replay tool requeues them after the incident.
+
+**Where Redis or caching helps:**
+- dedup fast path (`SET NX`)
+- the Celery broker
+- per-shop rate limiting and token buckets
+- circuit-breaker state shared across workers
+- caching per-shop secrets and config, if each shop gets its own HMAC secret
+- short-TTL caching of status lookups
+
+**Monitoring and alerting:**
+- *Metrics* (Prometheus/OpenTelemetry):
+  - request rate and p50/p99 latency by status code
+  - 401 rate (spikes suggest a misconfigured sender or an attack)
+  - duplicate rate
+  - queue depth and oldest-message age
+  - processing latency (`processed_at - created_at`)
+  - outcome counts (processed, retry, failed)
+  - downstream error rate and latency
+  - sweeper re-enqueue count
+  - DB pool saturation, replication lag, lock waits
+- *Alerts:*
+  - oldest unprocessed event older than N minutes
+  - FAILED rate above a threshold
+  - sweeper re-enqueues above 0 for a sustained period (the broker is losing messages)
+  - 5xx rate
+  - 401 spike
+  - DB CPU or connections near their limits
+  - circuit breaker open
+- *Logs:* JSON logs (already implemented) carry `event_id`/`shop_id`, so an event can be traced end to end. Add trace IDs propagated through task headers.
+- *Dashboards:* per-shop volume and failure breakdown.
+
+
+==========================================================================================
+FILE: AI_USAGE.md
+==========================================================================================
+# AI Usage Log
+
+I used **Claude Code** (inside VS Code) throughout this assignment. I treated it like a fast pair programmer: it drafted code and pointed out problems, and I decided what to keep. This log covers where I used it, what came out, and what changed along the way.
+
+---
+
+### 1. Reviewing my starting code
+
+I already had a basic version: a FastAPI endpoint, an SQLAlchemy model and an HMAC helper. I gave the AI the assignment brief and asked it to compare my code against the requirements.
+
+That review found several real problems:
+- **Wrong route.** I had `/webhook/orders`; the spec says `/webhooks/order`. I switched to the spec's path but kept the old one as a hidden alias so nothing that already called it breaks.
+- **Hardcoded secret.** `WEBHOOK_SECRET = "my-secret-key"` was sitting in the code. It now comes from `.env`, and the app refuses to start without one.
+- **Signature checked too late.** FastAPI was validating the body *before* my signature check, so anyone could send junk and read our validation errors. Now the HMAC is checked on the raw bytes first, and only authenticated requests get parsed.
+- **Race in duplicate detection.** I was doing "look up the `event_id`, insert if missing." Two identical requests arriving together could both pass the lookup. More on this below.
+- **Money as a float.** I changed `amount` to `Decimal`.
+
+### 2. Duplicate events
+
+When I asked how to block duplicates, the obvious answer was the check-then-insert I already had. That's not safe under concurrency, so I went with letting the database decide: `event_id` has a UNIQUE constraint, the API just inserts, and if the insert fails on that constraint we read the existing row and return `200 duplicate`.
+
+One thing I made sure of: if the insert fails for some *other* reason, the error is re-raised instead of being treated as a duplicate.
+
+### 3. Making sure two workers don't process the same event
+
+The AI suggested a few options: `SELECT ... FOR UPDATE`, a Redis lock, or a conditional UPDATE. I picked the **conditional UPDATE** ("set to PROCESSING only if it's currently RECEIVED or RETRYING"):
+- It's a single atomic statement, so only one worker can win.
+- No database lock is held while we wait on the downstream service.
+- It works the same on SQLite and Postgres.
+
+I then asked it to look for edge cases, and it found one I hadn't thought about. If a worker hangs past its timeout and another worker takes over, the first one could wake up and overwrite the result. To stop that, each claim gets a random token, and a worker can only save its result while it still holds that token.
+
+### 4. Retries — the first version didn't work
+
+The first draft used Celery's built-in `self.retry()`. When I ran the tests, two of them failed: in Celery's test (eager) mode, `self.retry()` raises an exception instead of running the task again.
+
+Instead of bending the tests around it, I changed the approach. The worker now records the failure in the database (`retry_count`, `error_message`, `next_retry_at`) and schedules a delayed re-run itself. That turned out to be better anyway: the retry limit lives in the database, so it survives worker restarts.
+
+### 5. Problems found while testing
+
+- **Timezones on SQLite.** SQLite returns datetimes without a timezone, which would have broken the "has this lease expired?" comparisons. I added a small custom column type that always stores and returns UTC.
+- **Table name clash.** My old table was `Webhook_events` and the new one is `webhook_events`. SQLite treats table names as case-insensitive, so the migration would have failed. The old table was empty, so I backed up the old DB file and started fresh.
+- **Broker down.** The AI pointed out that if Redis is down right after we save an event, the event would sit in RECEIVED forever. The API now still returns 202 (the event is safely stored), and a small scheduled "sweeper" job re-queues anything stuck.
+
+### 6. Tests
+
+The AI generated most of the test code. When I reviewed it, I made sure the tests check what actually happened in the database and how many times downstream was called, not just HTTP status codes. For the concurrency tests, the threads use a barrier so they really start at the same moment; otherwise the race might never actually happen during the test.
+
+### 7. Checking it for real
+
+Passing tests weren't enough for me, so I ran the API and a real Celery worker and set the fake downstream service to fail 30% of the time. Every event still ended up `PROCESSED`; some needed one or two retries. Sending the same event twice returned 200, and a bad signature returned 401.
+
+I couldn't test the Docker Compose setup because Docker isn't installed on my machine, and the README says so.
+
+### 8. Docs
+
+The AI drafted the README and the design note. I went through them to make sure they match the code and don't claim anything I didn't actually verify.
+
+---
+
+**Overall:** the AI saved a lot of typing and was especially good at spotting edge cases: the stale-worker overwrite, the broker-down gap, and the SQLite timezone issue. Its first answers weren't always right, though. Check-then-insert and `self.retry()` both looked fine until I tested them. Running the tests and the real worker is what caught those.
+
+
+==========================================================================================
+FILE: README.md
+==========================================================================================
+# Webhook Ingestion Service
+
+Receives order webhooks from shops, authenticates them with HMAC-SHA256, stores each event **exactly once**, and processes it **asynchronously** with retries, a dead-letter state, and safety against concurrent workers.
+
+**Stack:** FastAPI, SQLAlchemy 2, Alembic, Celery (Redis broker), PostgreSQL (SQLite for local dev and tests), pytest.
+
+Other documents:
+- [docs/DESIGN.md](docs/DESIGN.md): database design, concurrency and idempotency, scaling to about 10k req/s
+- [AI_USAGE.md](AI_USAGE.md): AI usage log
+- [docs/schema.postgres.sql](docs/schema.postgres.sql): generated PostgreSQL DDL
+
+---
+
+# Step-by-step guide: how to run and test this project
+
+This guide assumes you have never run this project before. Follow the steps in order, and don't skip any.
+
+There are two ways to test:
+- **Part A – Automated tests.** One command checks everything for you. It takes about 5 minutes to set up and 10 seconds to run.
+- **Part B – Manual testing.** You run the real service and send webhooks to it yourself, so you can see each piece working.
+
+Do Part A first. Part B is optional but fun.
+
+> **Windows or Mac/Linux?** Most commands are the same. Where they differ, both versions are shown. Windows users should use **Command Prompt (cmd)**; the commands below are written for it.
+
+---
+
+## Step 0 – Check that Python is installed
+
+You need **Python 3.11 or newer**. Open a terminal:
+- **Windows:** press the `Windows` key, type `cmd`, press Enter.
+- **Mac:** press `Cmd + Space`, type `Terminal`, press Enter.
+
+Type this and press Enter:
+
+```
+python --version
+```
+
+You should see something like `Python 3.13.1`. On Mac/Linux, if `python` doesn't work, try `python3 --version`, and use `python3` instead of `python` in every step below.
+
+**If you get "not recognized" or "command not found":**
+1. Install Python from https://www.python.org/downloads/
+2. **Windows only:** on the first screen of the installer, **tick the box "Add python.exe to PATH"** before you click Install. This is very important.
+3. Close the terminal, open a new one, and try `python --version` again.
+
+You do **not** need Docker, Redis or PostgreSQL to test this project.
+
+---
+
+## Step 1 – Open a terminal inside the project folder
+
+All commands must be run from inside the project folder, the one that contains `README.md` and the `app` folder.
+
+- **Windows (easy way):** open the project folder in File Explorer, click the address bar at the top, type `cmd` and press Enter. A terminal opens already in the right folder.
+- **Any system:** use `cd` with the folder's path, for example:
+  ```
+  cd C:\Users\YourName\Desktop\webhook-services
+  ```
+
+To check you're in the right place, run `dir` (Windows) or `ls` (Mac/Linux). You should see `README.md`, `app`, `tests` and `requirements.txt` in the list.
+
+---
+
+## Step 2 – Create a virtual environment
+
+A virtual environment ("venv") is a private folder that holds this project's Python libraries, so they don't mix with anything else on your computer.
+
+> ⚠️ **If the project folder you received already has a `venv` folder in it, delete that folder first.** A venv only works on the computer where it was created; copying it to another computer breaks it.
+
+Create a new one:
+
+```
+python -m venv venv
+```
+
+This takes a few seconds and creates a new `venv` folder.
+
+---
+
+## Step 3 – Activate the virtual environment
+
+**You must do this every time you open a new terminal for this project.**
+
+| Your terminal | Command |
+|---|---|
+| Windows – Command Prompt (cmd) | `venv\Scripts\activate` |
+| Windows – PowerShell | `venv\Scripts\Activate.ps1` |
+| Mac / Linux | `source venv/bin/activate` |
+
+When it works, you'll see **`(venv)`** at the start of your terminal line, like this:
+
+```
+(venv) C:\Users\YourName\Desktop\webhook-services>
+```
+
+**PowerShell says "running scripts is disabled on this system"?** Run this once, type `Y` to confirm, then try activating again:
+```
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+(Or just use Command Prompt instead of PowerShell.)
+
+---
+
+## Step 4 – Install the required libraries
+
+With `(venv)` showing, run:
+
+```
+pip install -r requirements.txt
+```
+
+This downloads everything the project needs (FastAPI, Celery, SQLAlchemy, pytest, …). It takes 1–2 minutes. Wait until you get your prompt back. Some yellow "notice" lines about upgrading pip are fine to ignore.
+
+---
+
+## Step 5 – Create your settings file (`.env`)
+
+The app reads its settings from a file called `.env`. A ready-made template, `.env.example`, comes with the project. Copy it:
+
+| System | Command |
+|---|---|
+| Windows | `copy .env.example .env` |
+| Mac / Linux | `cp .env.example .env` |
+
+Now open the new `.env` file in any text editor (Notepad, VS Code, …) and change **two things**:
+
+**1. Set a secret key.** This is the password that webhook senders use to sign their requests. Generate a random one:
+
+```
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Copy the long random text it prints, and put it after `WEBHOOK_SECRET=`, for example:
+
+```
+WEBHOOK_SECRET=3f9a1c...your-long-random-text...b72e
+```
+
+**2. Use the simple local queue (no Redis needed).** Find these two lines:
+
+```
+CELERY_BROKER_URL=redis://localhost:6379/0
+# CELERY_BROKER_URL=sqla+sqlite:///./celery-broker.db
+```
+
+and change them to this (add `#` to the first line, remove `#` from the second):
+
+```
+# CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_BROKER_URL=sqla+sqlite:///./celery-broker.db
+```
+
+Save the file.
+
+> **Why?** The background worker needs a message queue. Production uses Redis, but that's extra software to install. The `sqla+sqlite` option stores the queue in a small local file instead, so no extra software is needed.
+
+---
+
+## Step 6 – Create the database
+
+```
+alembic upgrade head
+```
+
+The last line should say something like:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 0001, create webhook_events
+```
+
+This creates a file called `webhook.db`, a small SQLite database, with the `webhook_events` table inside.
+
+✅ **Setup is finished.** You only need to do Steps 2–6 once.
+
+---
+
+## Part A – Run the automated tests
+
+With `(venv)` showing, run:
+
+```
+pytest
+```
+
+After a few seconds you should see a row of green dots and, at the end:
+
+```
+48 passed in 4.21s
+```
+
+**48 passed = everything works.** The tests use their own temporary database, so they don't touch your `webhook.db`, and you don't need to start anything else first.
+
+To see the name of every test as it runs, use `pytest -v`.
+
+What the tests check:
+
+| What is tested | What "pass" proves |
+|---|---|
+| Valid webhook | A correctly signed webhook is accepted (202), saved in the database, and sent to the queue |
+| Invalid signature | Missing, wrong, or tampered signatures are rejected (401) and nothing is saved |
+| Invalid data | Bad payloads (missing fields, negative amount, wrong date, …) are rejected (422) |
+| Duplicate `event_id` | Sending the same event twice saves it only once and processes it only once |
+| Background processing | The worker processes an event and marks it `PROCESSED` |
+| Failure and retry | A failing event is retried; after too many failures it's marked `FAILED` with the error saved |
+| Concurrency | 8 copies of the same event sent at the same moment → still only 1 saved and processed once |
+| Queue outage | If the queue is down, the webhook is still saved safely, and a cleanup job picks it up later |
+
+---
+
+## Part B – Manual testing (see it working live)
+
+You'll need **3 terminal windows** open at the same time, all in the project folder (Step 1) and **all with the venv activated (Step 3)**.
+
+### Terminal 1 – Start the background worker
+
+```
+celery -A app.worker worker --pool=solo --loglevel=INFO
+```
+
+Wait until you see a line ending in **`ready.`**. Leave this window open; it will show what the worker is doing.
+
+> Type the pool name exactly: `--pool=solo` (s-o-l-o). `--pool=solo` is needed on Windows and also works on Mac/Linux.
+
+### Terminal 2 – Start the API (web server)
+
+```
+uvicorn app.main:app --reload
+```
+
+Wait until you see:
+
+```
+Uvicorn running on http://127.0.0.1:8000
+```
+
+Leave this window open too.
+
+**Quick check:** open http://127.0.0.1:8000/health in your web browser. You should see:
+
+```json
+{"status":"ok","database":"ok"}
+```
+
+You can also open http://127.0.0.1:8000/docs to see an interactive page listing every endpoint.
+
+### Terminal 3 – Send test webhooks
+
+We provide a helper script that builds a sample order webhook and **signs it with your secret** automatically, just like a real shop would.
+
+**Test 1 – Send a new, valid webhook**
+
+```
+python scripts/send_webhook.py --event-id evt_test_1
+```
+
+Expected:
+
+```
+202 {"event_id":"evt_test_1","status":"RECEIVED","duplicate":false,"message":"Webhook accepted"}
+```
+
+- `202` means the webhook was accepted and saved.
+- Look at **Terminal 1** (the worker): within a second you'll see log lines with `"downstream accepted event"` and `"event processed"`.
+
+**Test 2 – Check the event's status**
+
+Open this in your browser:
+
+http://127.0.0.1:8000/webhooks/events/evt_test_1
+
+You should see `"status":"PROCESSED"`. The worker finished the job in the background.
+
+> If you see `"status":"RETRYING"` instead, that's normal. The settings file makes the fake downstream service fail 20% of the time on purpose (`DOWNSTREAM_FAILURE_RATE=0.2`) so retries can be demonstrated. Wait a few seconds and refresh the page; it will change to `PROCESSED`.
+
+**Test 3 – Send the same event again (duplicate)**
+
+```
+python scripts/send_webhook.py --event-id evt_test_1
+```
+
+Expected:
+
+```
+200 {"event_id":"evt_test_1","status":"PROCESSED","duplicate":true,"message":"Event already received"}
+```
+
+- `"duplicate":true` means the service recognized it had already seen this event.
+- Look at Terminal 1: **nothing new happens.** The event is not processed a second time.
+
+**Test 4 – Send a webhook with a wrong signature (fake sender)**
+
+```
+python scripts/send_webhook.py --bad-signature
+```
+
+Expected:
+
+```
+401 {"detail":"Invalid webhook signature"}
+```
+
+The request is rejected and nothing is saved.
+
+**Test 5 – Watch automatic retries**
+
+Here we make the fake downstream service fail often, so you can watch the retries.
+
+1. Open `.env` and set `DOWNSTREAM_FAILURE_RATE=0.5` (50% of calls will fail). To see retries faster, also set:
+   ```
+   RETRY_BACKOFF_BASE_SECONDS=1
+   RETRY_BACKOFF_MAX_SECONDS=4
+   ```
+2. **Restart the worker** so it reads the new settings: click Terminal 1, press `Ctrl + C`, wait for it to stop, then run the `celery ...` command again.
+3. In Terminal 3, send several events. Run this a few times; leaving out `--event-id` gives a new random ID each time:
+   ```
+   python scripts/send_webhook.py
+   ```
+4. In Terminal 1 you'll see some `"processing failed, scheduling retry"` lines, followed a few seconds later by `"event processed"` for the same event.
+5. Check one of them in the browser using the `event_id` printed by the script, for example `http://127.0.0.1:8000/webhooks/events/evt_ab12cd34ef`. Events that were retried show `"retry_count"` of 1 or more and end with `"status":"PROCESSED"`.
+
+To see an event give up completely and become `FAILED`, set `DOWNSTREAM_FAILURE_RATE=1` (every call fails), restart the worker, and send one event. After about 6 attempts (1 try + 5 retries), its status becomes `"FAILED"`, with the error saved in `"error_message"`.
+
+When you're done, set `DOWNSTREAM_FAILURE_RATE` back to `0.2` (or `0`).
+
+### Stopping everything
+
+In Terminal 1 and Terminal 2, press **`Ctrl + C`**.
+
+### Starting over with an empty database (optional)
+
+Stop the API and the worker, delete `webhook.db` and `celery-broker.db` (plus any `webhook.db-shm` / `webhook.db-wal` files), then run `alembic upgrade head` again.
+
+---
+
+## Troubleshooting
+
+| Problem / error message | What it means | How to fix |
+|---|---|---|
+| `'celery' is not recognized…` / `'uvicorn' is not recognized…` / `'pytest' is not recognized…` | The venv isn't active in this terminal | Run the activate command from Step 3. You must see `(venv)` |
+| `Invalid value for '-P' / '--pool': 'sol'…` | Typo in the command | Use `--pool=solo` |
+| `WEBHOOK_SECRET … Field required` | The `.env` file is missing or `WEBHOOK_SECRET` is empty | Redo Step 5. Make sure the file is named exactly `.env` (not `.env.txt`) and is in the project folder |
+| `webhook_secret … Value should have at least 16 items` | Your secret is empty or too short | Use the long random value from Step 5 |
+| `no such table: webhook_events` | The database wasn't created | Run `alembic upgrade head` (Step 6) |
+| `Error 10061 connecting to localhost:6379` or `Connection refused` mentioning Redis | The app is trying to use Redis, which isn't running | Do part 2 of Step 5 (switch to `sqla+sqlite`), then restart the worker and API |
+| The script always gets `401`, even without `--bad-signature` | The API is still using an old secret | You changed `.env` after starting the API. Restart it (`Ctrl + C`, then run `uvicorn` again) |
+| `ConnectError` / `Connection refused` when running the script | The API isn't running | Start it in Terminal 2 and wait for `Uvicorn running on…` |
+| `[Errno 10048] … address already in use` | Port 8000 is used by another program | Start the API on another port: `uvicorn app.main:app --port 8001`, and send with `python scripts/send_webhook.py --url http://127.0.0.1:8001/webhooks/order` |
+| Event stays `RECEIVED` and never becomes `PROCESSED` | The worker isn't running or is using different settings | Make sure Terminal 1 shows `ready.`, and that the API and worker were both started after your last `.env` change |
+| Windows file name shows as `.env.txt` | Notepad added `.txt` | In File Explorer, turn on View → "File name extensions" and rename the file to `.env` |
+| `pip install` fails building `psycopg` | Very old Python or pip | Use Python 3.11+ and run `python -m pip install --upgrade pip`, then retry Step 4 |
+
+---
+
+# Technical reference
+
+## How it works
+
+```
+ Shop ──POST /webhooks/order──▶ API ──1. verify HMAC on raw body (401 if bad)
+                                    ──2. validate payload (422 if bad)
+                                    ──3. INSERT row (status RECEIVED); UNIQUE(event_id) rejects duplicates
+                                    ──4. publish task id ──▶ Redis ──▶ Celery worker
+                                    ◀─ 202 Accepted (or 200 duplicate)            │
+                                                                                  ▼
+                                   claim row atomically (RECEIVED/RETRYING → PROCESSING)
+                                   call downstream (simulated)
+                                   ├─ ok ─────────────▶ PROCESSED
+                                   ├─ transient error ─▶ RETRYING, retry_count+1, delayed re-run (exp. backoff + jitter)
+                                   └─ permanent error / retries exhausted ─▶ FAILED (dead letter, error_message kept)
+
+ Celery beat (every 60s): sweeper re-enqueues events stuck in RECEIVED / overdue RETRYING / PROCESSING with an expired lease
+```
+
+Status lifecycle: `RECEIVED → PROCESSING → PROCESSED | RETRYING → PROCESSING … → FAILED`
+
+## API
+
+### `POST /webhooks/order`
+
+Headers:
+- `Content-Type: application/json`
+- `X-Webhook-Signature: sha256=<hex>`, where `<hex>` is `HMAC_SHA256(WEBHOOK_SECRET, raw_request_body)` in hex. The `sha256=` prefix is optional.
+
+| Response | When |
+|---|---|
+| `202 Accepted` `{"event_id", "status": "RECEIVED", "duplicate": false}` | New event stored and queued |
+| `200 OK` `{"duplicate": true, "status": "<current status>"}` | `event_id` seen before; nothing is re-processed |
+| `401` | Missing or invalid signature (checked **before** the payload is parsed) |
+| `400` / `422` | Body is not JSON / payload fails validation |
+| `413` | Body larger than `MAX_BODY_BYTES` |
+
+Duplicates return a 2xx status on purpose. A 4xx would make the sender keep retrying an event we already hold.
+
+Other endpoints:
+- `GET /webhooks/events/{event_id}`: processing status, retry count and last error. The payload isn't returned. In production this belongs behind internal auth.
+- `GET /health`: liveness plus a DB check.
+- `GET /docs`: OpenAPI UI.
+- `POST /webhook/orders`: the original route, kept as a hidden alias for backwards compatibility.
+
+Validation rules: identifiers are 1–100 chars from `[A-Za-z0-9_.:-]`, and `event_type` must match `order.<name>`. `timestamp` must be ISO-8601 **with a timezone**. `amount` is a `Decimal` ≥ 0, never a float, because it's money. Extra fields inside `data` are kept in the stored payload.
+
+## Running the sweeper (optional)
+
+The worker handles all normal processing. The **sweeper**, which re-queues events whose queue message was lost, runs on a schedule through Celery beat. To run it locally, use a fourth terminal:
+
+```bash
+celery -A app.worker beat --loglevel=INFO
+```
+
+**Broker note:** `.env.example` defaults to Redis (`redis://localhost:6379/0`), which is what production should use. The `sqla+sqlite` broker used in the guide above is for local testing only.
+
+## Signing a request manually (without the helper script)
+
+The signature is the HMAC-SHA256 of the exact raw request body, using `WEBHOOK_SECRET` as the key, written in hex. In bash (Git Bash, Mac, Linux):
+
+```bash
+BODY='{"event_id":"evt_1","event_type":"order.created","shop_id":"shop_123","timestamp":"2026-08-18T10:30:00Z","data":{"order_id":"ORD-1","customer_id":"CUS-1","amount":2500}}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/^.* //')
+curl -i -X POST localhost:8000/webhooks/order -H "Content-Type: application/json" -H "X-Webhook-Signature: sha256=$SIG" -d "$BODY"
+```
+
+### With Docker (PostgreSQL + Redis)
+
+```bash
+cp .env.example .env     # set WEBHOOK_SECRET
+docker compose up --build
+```
+
+This runs Postgres, Redis, a one-off `migrate` job, the API on :8000, a worker and beat. Compose overrides `DATABASE_URL` and `CELERY_BROKER_URL` to point at the containers.
+
+## Test files
+
+The tests use a throwaway SQLite file and need no broker: publishing is stubbed, or Celery runs in eager mode.
+
+| File | Covers |
+|---|---|
+| [tests/test_api.py](tests/test_api.py) | valid webhook, `sha256=` prefix, invalid HMAC (missing, garbage, wrong secret, tampered body, checked before validation), 422/400/413, duplicates, broker outage, legacy route, status endpoint |
+| [tests/test_processing.py](tests/test_processing.py) | success, transient → `RETRYING` → `PROCESSED`, retries exhausted → `FAILED`, permanent error, idempotent re-run, expired-lease reclaim and fencing, sweeper query, backoff bounds |
+| [tests/test_concurrency.py](tests/test_concurrency.py) | 8 threads delivering the same event → 1 row; 8 workers claiming → 1 winner; 8 duplicate task runs → downstream called once |
+| [tests/test_worker.py](tests/test_worker.py) | full Celery task path (eager) through the API, including retries and giving up; sweeper task |
+
+## Configuration
+
+All settings are environment variables (see [.env.example](.env.example) and [app/config.py](app/config.py)). `WEBHOOK_SECRET` has **no default**: the service refuses to start without one (minimum 16 chars). `.env` is git-ignored.
+
+## Project layout
+
+```
+app/
+  main.py           FastAPI app: auth → validate → store → enqueue
+  security.py       HMAC-SHA256 sign/verify (constant-time compare)
+  schemas.py        Pydantic request/response models
+  ingest.py         insert-once logic (UNIQUE constraint + IntegrityError)
+  processing.py     claim / process / finalize, retry policy, sweeper query
+  worker.py         Celery app, process + sweeper tasks, safe enqueue
+  downstream.py     simulated external order service
+  models.py         SQLAlchemy model, statuses, UTC datetime type
+  databases.py      engine/session setup (SQLite WAL + busy timeout)
+  config.py         typed settings (pydantic-settings)
+  logging_config.py JSON logs
+migrations/         Alembic migrations
+tests/              pytest suite
+scripts/send_webhook.py
+```
+
+## Decisions and known limitations
+
+- **SQLite vs PostgreSQL.** The code and migrations are portable. Tests and quick local runs use SQLite with WAL mode and a busy timeout. Production should use PostgreSQL: row-level locking, `JSONB`, `TIMESTAMPTZ` and real concurrent writers. `docker-compose.yml` uses Postgres.
+- **At-least-once delivery to downstream.** If a worker crashes *after* the downstream call succeeds but *before* it records `PROCESSED`, the event is retried after the lease expires. Exactly-once across a network boundary isn't possible, so the downstream call must be idempotent: pass `event_id` as its idempotency key.
+- **Replay protection** comes from `event_id` uniqueness. Replaying a captured request is a no-op duplicate. A signed timestamp header with a ±5 min window would also stop replays with new IDs, but it needs sender support. It's listed under next steps.
+- **Same `event_id` with a different payload** is treated as a duplicate: the first version wins and a warning is logged.
+- **Dead letter = `FAILED` rows.** They are queryable through the `(status, updated_at)` index and keep `error_message` and `retry_count`. A replay command or admin endpoint is not implemented. It would set `status='RECEIVED', retry_count=0` and enqueue.
+- **Not verified here:** the Docker Compose stack, because Docker wasn't available on the development machine. The full flow was verified end to end with uvicorn, a real Celery worker and the SQLAlchemy broker, with 30% simulated downstream failures: every event reached `PROCESSED` after retries. The PostgreSQL DDL was checked through Alembic's offline SQL output.
+
+**Next steps, in order:** signed-timestamp replay window, secret rotation (accept two secrets during rollover), a replay command for `FAILED` events, Prometheus metrics (see the design doc), and running the test suite against Postgres in CI.
+
+
+==========================================================================================
+END OF MAGIC.TXT
+==========================================================================================
